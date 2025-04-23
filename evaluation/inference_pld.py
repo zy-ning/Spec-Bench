@@ -3,29 +3,38 @@
 Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
+
 import argparse
 
-from evaluation.eval import run_eval, reorg_answer_file
-
 from fastchat.utils import str_to_torch_dtype
-
-from transformers import StoppingCriteriaList, MaxLengthCriteria
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from model.pld.pld import greedy_search_pld
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    MaxLengthCriteria,
+    StoppingCriteriaList,
+)
+
+from evaluation.eval import reorg_answer_file, run_eval
 
 
-def pld_forward(inputs, model, tokenizer, max_new_tokens):
+def pld_forward(inputs, model, tokenizer, max_new_tokens, fallback, use_csd_mgram):
     input_ids = inputs.input_ids
     output_ids, idx, accept_length_list = model.greedy_search_pld(
-              inputs.input_ids,
-              attention_mask=inputs.attention_mask,
-              stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=len(inputs.input_ids[0]) + max_new_tokens)]),
-              draft_matching_window_size=3,
-              draft_num_candidate_tokens=10,
-              use_cache=True,
-              pad_token_id=tokenizer.pad_token_id,
-              eos_token_id=tokenizer.eos_token_id,
-              return_dict_in_generate=False)
+        inputs.input_ids,
+        attention_mask=inputs.attention_mask,
+        stopping_criteria=StoppingCriteriaList(
+            [MaxLengthCriteria(max_length=len(inputs.input_ids[0]) + max_new_tokens)]
+        ),
+        draft_matching_window_size=3,
+        draft_num_candidate_tokens=10,
+        use_cache=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        return_dict_in_generate=False,
+        fallback=fallback,
+        use_csd_mgram=use_csd_mgram,
+    )
     input_len = len(input_ids[0])
     new_token = len(output_ids[0][input_len:])
     if tokenizer.eos_token_id in output_ids[0, input_len:].tolist():
@@ -36,7 +45,7 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens):
         if invalid_len > 0:
             accept_length_list[-1] -= invalid_len
             new_token -= invalid_len
-    return output_ids, new_token, idx+1, accept_length_list
+    return output_ids, new_token, idx + 1, accept_length_list
 
 
 if __name__ == "__main__":
@@ -59,9 +68,7 @@ if __name__ == "__main__":
         help="A debug option. The begin index of questions.",
     )
     parser.add_argument(
-        "--question-end",
-        type=int,
-        help="A debug option. The end index of questions."
+        "--question-end", type=int, help="A debug option. The end index of questions."
     )
     parser.add_argument("--answer-file", type=str, help="The output answer file.")
     parser.add_argument(
@@ -92,6 +99,17 @@ if __name__ == "__main__":
         choices=["float32", "float64", "float16", "bfloat16"],
         help="Override the default dtype. If not set, it will use float16 on GPU.",
     )
+    parser.add_argument(
+        "--fallback",
+        type=str,
+        default="none",
+        choices=["none", "model", "data"],
+    )
+    parser.add_argument(
+        "--use-csd-mgram",
+        action="store_true",
+        help="Use max gram drafter to generate the answer.",
+    )
 
     args = parser.parse_args()
 
@@ -99,16 +117,19 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}.jsonl"
+        suffix = "_csd" if args.use_csd_mgram else ""
+        suffix += f"_{args.fallback}" if args.fallback != "none" else ""
+        answer_file = (
+            f"data/{args.bench_name}/model_answer/{args.model_id}{suffix}.jsonl"
+        )
 
     print(f"Output to {answer_file}")
-
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=str_to_torch_dtype(args.dtype),
         low_cpu_mem_usage=True,
-        device_map="auto"
+        device_map="auto",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -128,6 +149,8 @@ if __name__ == "__main__":
         num_choices=args.num_choices,
         num_gpus_per_model=args.num_gpus_per_model,
         num_gpus_total=args.num_gpus_total,
+        fallback=args.fallback,
+        use_csd_mgram=args.use_csd_mgram,
     )
 
     reorg_answer_file(answer_file)
