@@ -1,7 +1,8 @@
-import json
 import argparse
-from transformers import AutoTokenizer
+import json
+
 import numpy as np
+from transformers import AutoTokenizer
 
 
 def speed(jsonl_file, jsonl_file_base, tokenizer, task=None, report=True):
@@ -144,7 +145,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mean-report",
         action="store_true",
-        default=True,
+        default=False,
         help="report mean speedup over different runs")
 
     args = parser.parse_args()

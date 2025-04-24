@@ -8,10 +8,10 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import json
 import os
 import time
-import torch
+
 import numpy as np
 import shortuuid
-
+import torch
 from fastchat.llm_judge.common import load_questions
 from fastchat.model import get_conversation_template
 from tqdm import tqdm
@@ -105,48 +105,49 @@ def get_model_answers(
             prompt = conv.get_prompt()
             inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
             input_ids = inputs.input_ids
-            try:
-                torch.cuda.synchronize()
-                start_time = time.time()
-                output_ids, new_token, step, accept_length_tree = forward_func(
-                    inputs,
-                    model,
-                    tokenizer,
-                    max_new_tokens,
-                    **kwargs,
-                )
-                torch.cuda.synchronize()
-                total_time = time.time() - start_time
-                output_ids = output_ids[0][len(input_ids[0]):]
-                # be consistent with the template's stop_token_ids
-                if conv.stop_token_ids:
-                    stop_token_ids_index = [
-                        i
-                        for i, id in enumerate(output_ids)
-                        if id in conv.stop_token_ids
-                    ]
-                    if len(stop_token_ids_index) > 0:
-                        output_ids = output_ids[: stop_token_ids_index[0]]
+            # try:
+            torch.cuda.synchronize()
+            start_time = time.time()
+            output_ids, new_token, step, accept_length_tree = forward_func(
+                inputs,
+                model,
+                tokenizer,
+                max_new_tokens,
+                **kwargs,
+            )
+            torch.cuda.synchronize()
+            total_time = time.time() - start_time
+            output_ids = output_ids[0][len(input_ids[0]):]
+            # be consistent with the template's stop_token_ids
+            if conv.stop_token_ids:
+                stop_token_ids_index = [
+                    i
+                    for i, id in enumerate(output_ids)
+                    if id in conv.stop_token_ids
+                ]
+                if len(stop_token_ids_index) > 0:
+                    output_ids = output_ids[: stop_token_ids_index[0]]
 
-                output = tokenizer.decode(
-                    output_ids,
-                    spaces_between_special_tokens=False,
-                )
-                if conv.stop_str and output.find(conv.stop_str) > 0:
-                    output = output[: output.find(conv.stop_str)]
-                for special_token in tokenizer.special_tokens_map.values():
-                    if isinstance(special_token, list):
-                        for special_tok in special_token:
-                            output = output.replace(special_tok, "")
-                    else:
-                        output = output.replace(special_token, "")
-                output = output.strip()
+            output = tokenizer.decode(
+                output_ids,
+                spaces_between_special_tokens=False,
+            )
+            if conv.stop_str and output.find(conv.stop_str) > 0:
+                output = output[: output.find(conv.stop_str)]
+            for special_token in tokenizer.special_tokens_map.values():
+                if isinstance(special_token, list):
+                    for special_tok in special_token:
+                        output = output.replace(special_tok, "")
+                else:
+                    output = output.replace(special_token, "")
+            output = output.strip()
 
-                if conv.name == "xgen" and output.startswith("Assistant:"):
-                    output = output.replace("Assistant:", "", 1).strip()
-            except RuntimeError as e:
-                print("ERROR question ID: ", question["question_id"])
-                output = "ERROR"
+            if conv.name == "xgen" and output.startswith("Assistant:"):
+                output = output.replace("Assistant:", "", 1).strip()
+            # except RuntimeError as e:
+            #     print("ERROR question ID: ", question["question_id"])
+            #     print(e)
+            #     output = "ERROR"
 
             turns.append(output)
             steps.append(int(step))

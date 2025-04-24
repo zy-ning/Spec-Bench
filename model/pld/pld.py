@@ -1,13 +1,14 @@
 import copy
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
-
-from transformers.utils import ModelOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
+from transformers.generation.streamers import BaseStreamer
 from transformers.generation.utils import _crop_past_key_values
+from transformers.utils import ModelOutput
 
 device = torch.device('cuda:0')
 
@@ -47,6 +48,91 @@ def find_candidate_pred_tokens(input_ids, max_ngram_size=3, num_pred_tokens=10):
     return torch.tensor([], dtype=torch.long, device=input_ids.device)
 
 
+def _bigram_sampling(input_id, bi_gram_model):
+    res = bi_gram_model[input_id]
+    for i in range(2 - len(res.shape)):
+        res = res.unsqueeze(0)
+    return res
+
+def torch_index(t, value):
+    return (t == value).nonzero(as_tuple=True)[0][0]
+
+def _fast_n_gram_search_index(input_ids, encoder_ids, n=1):
+    # print(f"input_ids: {input_ids}, encoder_ids: {encoder_ids}")
+    encoder_ids = torch.cat([encoder_ids, input_ids[0, :-1].unsqueeze(0)], dim=-1)
+    # print(f"encoder_ids: {encoder_ids}")
+    matches = (encoder_ids[0] == input_ids[0, -1]).int()
+    # print(f"matches: {matches}")
+    if matches.sum() < 1:
+        print("Matched tokens: 0")
+        return None
+    for i in range(2, input_ids.shape[-1] + 1):
+        new_matches = (encoder_ids[0, :(-1 * (i - 1))] == input_ids[0, -1 * i]).int()
+        combined_matches = (2 - new_matches == matches[1:]).int()
+        if combined_matches.sum() < 1:
+            max_matched_length = i - 1
+            print(f"Matched tokens: {max_matched_length}")
+            index = torch_index(torch.cat((torch.tensor([0] * (i - 1), device=torch.device(encoder_ids.device)), matches), dim=-1), 1)
+            return encoder_ids[:, index:index + n]
+        else:
+            matches = combined_matches
+    # print(f"result matches: {matches}")
+    # Full suffix matched (length = input_ids.shape[-1])
+    max_matched_length = input_ids.shape[-1]
+    print(f"Matched tokens: {max_matched_length}")
+    index = torch_index(torch.cat((torch.tensor([0] * (encoder_ids.shape[-1] - matches.shape[-1]), device=matches.device), matches), dim=-1), 1)
+    return encoder_ids[:, index+1:index + n+1]
+
+def draft_sample_k_bn_gram(initial_input, input_ids, k, bigram_list=None):
+    """_summary_
+
+    Args:
+        model (_type_): smallest model used for verification
+        initial_input (_type_): question
+        input_ids (_type_): partial answer
+        k (_type_): number of tokens to sample
+        n (_type_): n-gram model to exact match
+        bigram_list (_type_): bigram model to sample, if None, no fallback
+    bigram sampling will be used
+    """
+    t0 = input_ids.shape[-1]
+    inputs_plus_k = input_ids
+    candidate_chunk = _fast_n_gram_search_index(inputs_plus_k, initial_input, k)
+    if candidate_chunk is not None:
+        candidate_chunk = candidate_chunk.to(inputs_plus_k.device)
+        inputs_plus_k = torch.cat(
+            [inputs_plus_k, candidate_chunk],
+            dim=-1)
+        if inputs_plus_k.shape[-1] >= t0 + k:
+            # print('_fast_n_gram_search_index Newly proposed tokens len')
+            # print(inputs_plus_k.shape[-1] - input_ids.shape[-1])
+            return inputs_plus_k
+    # Try to do max gram match in generated input ids
+    candidate_chunk = _fast_n_gram_search_index(inputs_plus_k, inputs_plus_k[:,:-1], k)
+    if candidate_chunk is not None:
+        candidate_chunk = candidate_chunk.to(inputs_plus_k.device)
+        inputs_plus_k = torch.cat(
+            [inputs_plus_k, candidate_chunk],
+            dim=-1)
+        if inputs_plus_k.shape[-1] >= t0 + k:
+            return inputs_plus_k
+    # Check if using bigram sampling as fallback
+    if bigram_list is None:
+        return inputs_plus_k
+    print('[bigram sampling]', end=" ")
+    next_tokens = []
+    cur_token = inputs_plus_k[0][-1]
+    for i in range(t0 + k - inputs_plus_k.shape[-1]):
+        ## do drafting from exact match or bigram sampling
+        next_token = _bigram_sampling(cur_token, bigram_list).to(inputs_plus_k.device)
+        next_tokens.append(next_token)
+        cur_token = next_token
+    inputs_plus_k = torch.cat(
+            [inputs_plus_k] + next_tokens,
+            dim=-1)
+    return inputs_plus_k  ## no logits can be returned anymore
+
+
 @torch.no_grad()
 def greedy_search_pld(
         self,
@@ -64,6 +150,8 @@ def greedy_search_pld(
         streamer: Optional["BaseStreamer"] = None,
         draft_matching_window_size=3,
         draft_num_candidate_tokens=10,
+        fallback="none",
+        use_csd_mgram=False,
         **model_kwargs,
 ):
     global tokenizer
@@ -79,23 +167,51 @@ def greedy_search_pld(
     # # init attention / hidden states / scores tuples
     scores = () if (return_dict_in_generate and output_scores) else None
 
+    bi_gram_model = None
+    bi_gram_path = None
+    if fallback.lower() == "none":
+        fallback = None
+    elif fallback.lower() == "data":
+        bi_gram_path = "/gemini/user/private/my/CS-Drafting/bigram_models/wiki_bigram_naive_bayers_greedy_llama_next_token.json"
+    elif fallback.lower() == "model":
+        bi_gram_path = "/gemini/user/private/my/Spec-Bench/data/model_bigram/bigram_mapping.json"
+    
+    if bi_gram_path is not None:
+        with open(bi_gram_path, "r") as f:
+            bi_gram_model = json.load(f)
+        bi_gram_model = torch.tensor(bi_gram_model)
+        bi_gram_model = bi_gram_model.to(input_ids.device)
+
     max_len = stopping_criteria[0].max_length
 
     step = 0
     accept_length_list = []
+    initial_input_ids = input_ids.clone()
     while True:
         step += 1
         cur_len = input_ids.shape[-1]
-
-        candidate_pred_tokens = find_candidate_pred_tokens(input_ids, draft_matching_window_size,
-                                                           draft_num_candidate_tokens)
-
-        if len(candidate_pred_tokens) == 0:
-            candidate_pred_tokens = torch.tensor([100], device=input_ids.device).unsqueeze(0)
+        
+        if use_csd_mgram:
+             # Use draft_sample_k_bn_gram to generate candidate input_ids
+             candidate_input_ids = draft_sample_k_bn_gram(
+                 initial_input_ids,
+                 input_ids,
+                 draft_num_candidate_tokens,
+                 bi_gram_model
+             )
         else:
-            candidate_pred_tokens = candidate_pred_tokens.unsqueeze(0)
+            # Use find_candidate_pred_tokens for candidate generation
+            candidate_pred_tokens = find_candidate_pred_tokens(input_ids, draft_matching_window_size,
+                                                               draft_num_candidate_tokens)
 
-        candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
+            if len(candidate_pred_tokens) == 0:
+                # Handle case where no candidate tokens are found (e.g., generate a default token or handle differently)
+                # Using a default token [100] as in the original code for now.
+                candidate_pred_tokens = torch.tensor([100], device=input_ids.device).unsqueeze(0)
+            else:
+                candidate_pred_tokens = candidate_pred_tokens.unsqueeze(0)
+
+            candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
 
         candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
 
@@ -118,9 +234,14 @@ def greedy_search_pld(
         new_logits = outputs.logits[:, -candidate_length - 1:]  # excludes the input prompt if present
         selected_tokens = new_logits.argmax(dim=-1)
         candidate_new_tokens = candidate_input_ids[:, -candidate_length:]
-        n_matches = ((~(candidate_new_tokens == selected_tokens[:, :-1])).cumsum(dim=-1) < 1).sum()
+        if candidate_length > 0:
+             n_matches = ((~(candidate_new_tokens == selected_tokens[:,:-1])).cumsum(dim=-1) < 1).sum()
+        else:
+             n_matches = 0
 
         n_matches = min(n_matches, max_len - cur_len - 1)
+        accept_rate = n_matches / candidate_length if candidate_length > 0 else 0
+        print(f"Step {step}: accept rate: {accept_rate:.2f}, candidate length: {candidate_length}, n_matches: {n_matches}")
 
         valid_tokens = selected_tokens[:, : n_matches + 1]
         input_ids = torch.cat((input_ids, valid_tokens), dim=-1)
@@ -144,3 +265,11 @@ def greedy_search_pld(
 
     idx = step - 1
     return input_ids, idx, accept_length_list
+
+
+if __name__ == "__main__":
+    
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    encoder_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    res = _fast_n_gram_search_index(input_ids, encoder_ids, 3)
+    print(res)

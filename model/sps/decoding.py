@@ -1,11 +1,12 @@
-import torch
 import copy
+import os
+import time
 import warnings
-
 from dataclasses import dataclass
-
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GreedySearchOutput, ModelOutput
+
+import torch
+import torch.distributed as dist
 from transformers.generation.candidate_generator import (
     AssistedCandidateGenerator,
     CandidateGenerator,
@@ -13,8 +14,13 @@ from transformers.generation.candidate_generator import (
     _prepare_attention_mask,
     _prepare_token_type_ids,
 )
-import torch.distributed as dist
-import os, time
+from transformers.generation.utils import (
+    GreedySearchOutput,
+    LogitsProcessorList,
+    ModelOutput,
+    StoppingCriteriaList,
+)
+
 FUNC_MAP = {}
 CONFIG_MAP = {}
 COLOR_PRINT = int(os.environ.get("COLOR_PRINT", 0))

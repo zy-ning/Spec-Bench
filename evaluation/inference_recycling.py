@@ -3,16 +3,15 @@ This code is based on SpecBench
 https://github.com/hemingkx/Spec-Bench
 """
 import argparse
+
+import torch
 from fastchat.utils import str_to_torch_dtype
-from evaluation.eval import run_eval, reorg_answer_file
-
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 from model.recycling.kv_cache import initialize_past_key_values
 from model.recycling.modeling_llama_kv import LlamaForCausalLM
 from model.recycling.tree_template_ import choose_tree_template
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import torch
+from evaluation.eval import reorg_answer_file, run_eval
 
 
 @torch.no_grad()
@@ -116,6 +115,11 @@ def recycling_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0,
         best_path_index = torch.argmax(reward, dim=-1).to(torch.long)
         index_path = search_path[best_path_index][:accept_len]
         best_path_input = torch.index_select(input_ids, index=index_path, dim=1)
+        
+        step = i + 1
+        accept_rate = (best_path_index + 1) / len(search_path)
+        candidate_length = len(search_path[best_path_index])        
+        print(f"Step {step}: accept rate: {accept_rate:.2f}, candidate length: {candidate_length}, accept length: {accept_len}, best path index: {best_path_index}, best path input: {best_path_input}")
 
         tgt = past_key_values_data[..., verify_input_ids.size(1)+index_path, :]
         dst = past_key_values_data[..., verify_input_ids.size(1) : verify_input_ids.size(1) + tgt.shape[-2], :]
