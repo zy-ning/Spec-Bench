@@ -12,6 +12,7 @@ dependencies = [
     "gradio==3.50.2",
     "maturin==0.12",
     "openai==0.28.0",
+    "pip>=25.0.1",
     "protobuf==3.19.0",
     "sentencepiece==0.2.0",
     "torch>=2.1.1",

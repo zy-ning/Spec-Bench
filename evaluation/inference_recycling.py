@@ -6,12 +6,12 @@ import argparse
 
 import torch
 from fastchat.utils import str_to_torch_dtype
-from model.recycling.kv_cache import initialize_past_key_values
-from model.recycling.modeling_llama_kv import LlamaForCausalLM
-from model.recycling.tree_template_ import choose_tree_template
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from evaluation.eval import reorg_answer_file, run_eval
+from model.recycling.kv_cache import initialize_past_key_values
+from model.recycling.modeling_llama_kv import LlamaForCausalLM
+from model.recycling.tree_template_ import choose_tree_template
 
 
 @torch.no_grad()
@@ -24,12 +24,15 @@ def recycling_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0,
     verify_input_ids = input_ids[:, :-1]
     input_ids = input_ids[:, -1:]
     
+    # Clear the adj_matrix
+    adj_matrix = torch.zeros((model.vocab_size, args.output_id_topk), dtype=torch.long, device=model.device, requires_grad=False)
+    
     (
         past_key_values,
         past_key_values_data,
         current_length_data,
     ) = initialize_past_key_values(model)
-        
+
     model(input_ids=verify_input_ids, past_key_values=past_key_values)
     
     tree_template = choose_tree_template(tree_version)
