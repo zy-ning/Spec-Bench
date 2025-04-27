@@ -24,8 +24,8 @@ def recycling_forward(inputs, model, tokenizer, max_new_tokens, temperature=0.0,
     verify_input_ids = input_ids[:, :-1]
     input_ids = input_ids[:, -1:]
     
-    # Clear the adj_matrix
-    adj_matrix = torch.zeros((model.vocab_size, args.output_id_topk), dtype=torch.long, device=model.device, requires_grad=False)
+    # # Clear the adj_matrix
+    # adj_matrix = torch.zeros((model.vocab_size, args.output_id_topk), dtype=torch.long, device=model.device, requires_grad=False)
     
     (
         past_key_values,
