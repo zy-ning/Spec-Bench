@@ -37,7 +37,7 @@ torch_dtype="float16" # ["float32", "float64", "float16", "bfloat16"]
 
 SKIP_RATIO=0.4
 OPT_INTERVAL=128
-DET=0.8
+DET=0.1
 DRAFT_LEN=4
 
 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_clasp --model-path $Vicuna_PATH --model-id ${MODEL_NAME} \

@@ -11,8 +11,11 @@ from transformers import AutoTokenizer
 # Assuming these are correctly adapted or available:
 from evaluation.eval import reorg_answer_file, run_eval
 from model.clasp.kv_cache import (
-    clone_past_key_values,
+    # clone_past_key_values,
     initialize_past_key_values,
+)
+from model.clasp.modeling_llama import (
+    LlamaForCausalLM,  # Ensure this class is adapted as per previous steps
 )
 
 # Import CLASP utils
@@ -24,11 +27,6 @@ from model.clasp.utils import (  # Ensure this points to your utils
     clasp_verify,
     prepare_logits_processor,
     set_logger,
-)
-
-# Import your potentially modified Llama model class
-from model.swift.modeling_llama import (
-    LlamaForCausalLM,  # Ensure this class is adapted as per previous steps
 )
 
 
@@ -63,19 +61,23 @@ def clasp_forward(
     DET = args.draft_exit_threshold
     # Initialize KV cache for the verify model
     # ! initialize_past_key_values now returns:
-    # past_key_values_list (List[List[KVCache]]),
-    # past_key_values_data_list (List[Tensor]),
+    # past_key_values (List[List[KVCache]]),
+    # past_key_values_data (List[Tensor]),
     # current_length_data (Tensor)
-    past_key_values_list, past_key_values_data_list, current_length_data = (
+    past_key_values, past_key_values_data, current_length_data = (
         initialize_past_key_values(model.model)
     )  # Pass base model
+    model.past_key_values = past_key_values
+    model.past_key_values_data = past_key_values_data
+    model.current_length_data = current_length_data
+    
     # --- Initial Prefill ---
     start_prefill = time.time()
     # The model's forward should internally use/update the KVCache objects
     # when use_cache=True. Pass the list of KVCache objects.
     prefill_outputs = model(
         input_ids=input_ids,
-        past_key_values=past_key_values_list,  # Pass the list of KVCache objects
+        past_key_values=past_key_values,  # Pass the list of KVCache objects
         use_cache=True,
         output_hidden_states=True,
     )
@@ -126,6 +128,7 @@ def clasp_forward(
                 model_layers=model.model.layers,
                 device=device,
             )
+            # logging.info("CLaSp DP Optimization: Layer to skip: ", current_draft_skip_mask)
             tokens_accepted_since_last_optim = 0  # Reset counter
             logging.info(
                 f"CLaSp DP time: {time.time() - start_dp:.4f}s. Skipped {torch.sum(current_draft_skip_mask)} layers."
@@ -147,16 +150,17 @@ def clasp_forward(
         # --- 2. Drafting (Autoregressive) ---
         start_draft = time.time()
         draft_tokens = []
-        # Use a *cloned* KV cache structure for drafting
-        # We need to clone the underlying data tensors and create new KVCache objects
-        draft_past_key_values_data_list = [d.clone() for d in past_key_values_data_list]
-        draft_current_length_data = (
-            current_length_data.clone()
-        )  # This tracks lengths for the draft cache
-        # Create new KVCache objects pointing to the *cloned* data
-        draft_kv_cache_list = clone_past_key_values(
-            model, draft_past_key_values_data_list, draft_current_length_data
-        )
+        # # Use a *cloned* KV cache structure for drafting
+        # # We need to clone the underlying data tensors and create new KVCache objects
+        # draft_past_key_values_data_list = [d.clone() for d in past_key_values_data_list]
+        # draft_current_length_data = (
+        #     current_length_data.clone()
+        # )  # This tracks lengths for the draft cache
+        # # Create new KVCache objects pointing to the *cloned* data
+        # draft_kv_cache_list = clone_past_key_values(
+        #     model, draft_past_key_values_data_list, draft_current_length_data
+        # )
+
         next_draft_input_ids = torch.tensor(
             [input_ids_list[0][-1]], device=device
         ).unsqueeze(0)
@@ -165,14 +169,20 @@ def clasp_forward(
         timings["draft_clone_kv"].append(clone_kv_end_time - start_draft)
 
         for draft_step_idx in range(K):
+            draft_i_start = time.time()
             # Pass the draft KVCache list to the model during drafting
             with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
                 draft_outputs = model(  # Call the main model forward
                     input_ids=next_draft_input_ids,
-                    past_key_values=draft_kv_cache_list,  # Use draft cache list
-                    use_cache=True,
+                    # past_key_values=draft_kv_cache_list,  # Use draft cache list
+                    past_key_values=past_key_values,
+                    # use_cache=True,
                     output_hidden_states=False,
                 )
+            draft_i_end_time = time.time()
+            logging.info(
+                f"Drafting foward step {draft_step_idx + 1} time: {draft_i_end_time - draft_i_start:.4f}s"
+            )
             draft_logits = draft_outputs.logits[:, -1, :]  # Logits for next token
             # draft_kv_cache_list is automatically updated by the forward pass
             # (DET check and sampling logic unchanged)
@@ -184,18 +194,23 @@ def clasp_forward(
                 draft_logits_processed = draft_logits
             draft_probs = torch.softmax(draft_logits_processed, dim=-1)
             top1_prob = torch.max(draft_probs, dim=-1).values.item()
-            if top1_prob < DET and len(draft_tokens) > 0:
-                logging.info(
-                    f"Drafting stopped early at len {len(draft_tokens)} due to DET ({top1_prob:.3f} < {DET})"
-                )
-                break
             if logits_processor:
                 next_token = torch.multinomial(draft_probs, num_samples=1)
             else:
                 next_token = torch.argmax(draft_logits_processed, dim=-1, keepdim=True)
             draft_tokens.append(next_token.item())
             next_draft_input_ids = next_token
+            if top1_prob < DET and len(draft_tokens) > 0:
+                logging.info(
+                    f"Drafting stopped early at len {len(draft_tokens)} due to DET ({top1_prob:.3f} < {DET})"
+                )
+                break
             if next_token.item() == tokenizer.eos_token_id:
+                break
+            if len(draft_tokens) + generated_token_count >= max_new_tokens - 2:
+                logging.info(
+                    f"Drafting stopped due to max new tokens limit ({max_new_tokens})."
+                )
                 break
         
         # --- End Drafting Loop ---
@@ -211,7 +226,7 @@ def clasp_forward(
 
         # --- 3. Verification (Parallel) ---
         start_verify = time.time()
-        verify_kv_cache_list = past_key_values_list  # Use main KVCache list
+        # verify_kv_cache_list = past_key_values_list  # Use main KVCache list
         current_seq_len = current_length_data[
             0
         ].item()  # Get current length BEFORE verify
@@ -226,8 +241,8 @@ def clasp_forward(
         # Pass the main KVCache list
         verify_outputs = model(
             input_ids=verify_input_ids,
-            past_key_values=verify_kv_cache_list,  # Pass main cache list
-            use_cache=True,  # This should update the main cache IN PLACE
+            past_key_values=past_key_values,  # Pass main cache list
+            # use_cache=True,  # This should update the main cache IN PLACE
             output_hidden_states=True,
             output_attentions=False,
         )

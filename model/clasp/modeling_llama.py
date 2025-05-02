@@ -409,8 +409,8 @@ class LlamaModel(_LlamaModel):
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
                 input_shape,
-                # inputs_embeds.dtype,
-                torch.float32,
+                inputs_embeds.dtype,
+                # torch.float32,
                 device=inputs_embeds.device,
                 past_key_values_length=past_key_values_length,
             )
@@ -439,10 +439,10 @@ class LlamaModel(_LlamaModel):
 
         # return combined_attention_mask
 
-        if combined_attention_mask is not None:
-            combined_attention_mask = combined_attention_mask.to(
-                dtype=inputs_embeds.dtype
-            )
+        # if combined_attention_mask is not None:
+        #     combined_attention_mask = combined_attention_mask.to(
+        #         dtype=inputs_embeds.dtype
+        #     )
         return combined_attention_mask
 
     def forward(
@@ -526,6 +526,9 @@ class LlamaModel(_LlamaModel):
             inputs_embeds,
             past_key_values_length,
         )
+        
+        print("input_ids shape:", input_ids.shape)
+        print("attention_mask shape:", attention_mask.shape)
 
         hidden_states = inputs_embeds
 
@@ -667,23 +670,11 @@ class LlamaForCausalLM(_LlamaForCausalLM):
             dynamic_skip_mask  # Store the dynamic mask there
         )
         try:
-            yield  # Execute code within the 'with' block
+            yield None # Execute code within the 'with' block
         finally:
             # Restore previous state cleanly
             self.model._is_drafting = original_draft_state
             self.model._draft_dynamic_skip_mask = original_mask
-
-    def set_skip_layers(self, attn_skip_layer_id_set=None, mlp_skip_layer_id_set=None):
-        if attn_skip_layer_id_set is not None:
-            global _attn_skip_layer_id_set
-            _attn_skip_layer_id_set = attn_skip_layer_id_set
-
-        if mlp_skip_layer_id_set is not None:
-            global _mlp_skip_layer_id_set
-            _mlp_skip_layer_id_set = mlp_skip_layer_id_set
-
-    def get_skip_layers(self):
-        return _attn_skip_layer_id_set, _mlp_skip_layer_id_set
 
     def add_bitfit(self, dtype=torch.float):
         global enabled_bitfit
@@ -714,8 +705,8 @@ class LlamaForCausalLM(_LlamaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        draft_attn_skip_mask: torch.Tensor = None,
-        draft_mlp_skip_mask: torch.Tensor = None,
+        # draft_attn_skip_mask: torch.Tensor = None,
+        # draft_mlp_skip_mask: torch.Tensor = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -768,8 +759,8 @@ class LlamaForCausalLM(_LlamaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            draft_attn_skip_mask=draft_attn_skip_mask,
-            draft_mlp_skip_mask=draft_mlp_skip_mask,
+            # draft_attn_skip_mask=draft_attn_skip_mask,
+            # draft_mlp_skip_mask=draft_mlp_skip_mask,
         )
 
         hidden_states = outputs[0]
