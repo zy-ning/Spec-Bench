@@ -47,7 +47,6 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens, fallback, use_csd_mgra
             accept_length_list[-1] -= invalid_len
             new_token -= invalid_len
     return output_ids, new_token, idx + 1, accept_length_list
-    return output_ids, new_token, idx + 1, accept_length_list
 
 
 if __name__ == "__main__":

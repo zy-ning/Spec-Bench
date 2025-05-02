@@ -1,13 +1,11 @@
 import copy
-import os.path
-import random
 import json
 import logging
-import torch
-import numpy as np
-from .kv_cache import clone_past_key_values
-TOPK = 10  # topk for sparse tree
+import os.path
+import random
 
+import numpy as np
+import torch
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -16,6 +14,9 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
+from .kv_cache import clone_past_key_values
+
+TOPK = 10  # topk for sparse tree
 
 def set_logger(log_path=None):
     """Set the logger to log info in terminal and file `log_path`.

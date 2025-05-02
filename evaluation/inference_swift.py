@@ -4,7 +4,9 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
+import logging
 import random
+import time
 
 import numpy as np
 import torch
@@ -53,10 +55,12 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     input_len = input_ids.shape[1]
     cur_length = input_len
     reset_swift_mode(model)
+    start_prefill = time.time()
     swift_logits, sample_token, top1_prob = initialize_swift(input_ids, model, max_new_tokens,
                                                              past_key_values, past_key_values_data,
                                                              current_length_data, logits_processor=logits_processor)
 
+    logging.info(f"Prefill time: {time.time() - start_prefill:.4f}s")
     # Clone the prefilled past key and value states for swift optimization
     input_past_key_values_data = []
     for i in range(len(past_key_values_data)):
@@ -66,7 +70,22 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     new_token_num = 0
     draft_token_num = 0
     total_acc_num = 0
+    
+    timings = {
+        "total_step": [],
+        # "dp_optim": [],
+        # "draft_clone_kv": [],
+        "draft_loop": [],
+        "verify": [],
+        "accept_update": [],
+        "misc_overhead": [],
+    }
+    step_end_time = time.time()  # Initialize before loop
+
     for idx in range(max_steps):
+        start_step = time.time()
+        timings["misc_overhead"].append(start_step - step_end_time)
+        
         # drafted tokens + 1 bonus verified token
         draft_token_num += len(top1_prob)
         # Initialize the swift buffer
@@ -92,6 +111,10 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             input_ids,
             swift_buffers["retrieve_indices"],
         )
+        
+        verify_end_time = time.time()
+        timings["verify"].append(verify_end_time - start_step)
+
 
         best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor, cart_candidates_prob, swift_logits[2],
@@ -110,6 +133,9 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             current_length_data,
             sample_p
         )
+        accept_update_end_time = time.time()
+        timings["accept_update"].append(accept_update_end_time - verify_end_time)
+
 
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
@@ -123,6 +149,8 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 statistics,
                 optimizer=optimizer,
                 utility=utility)
+        
+
 
         # swift drafting
         swift_logits, top1_prob = swift_draft(
@@ -134,6 +162,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
         )
+        
+        draft_loop_end_time = time.time()
+        timings["draft_loop"].append(draft_loop_end_time - accept_update_end_time)
+
+        
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
@@ -142,8 +175,24 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             break
         if new_token_num > max_new_tokens:
             break
+        
+        step_end_time = time.time()
+        timings["total_step"].append(step_end_time - start_step)
+        
+        
     # logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
-    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
+    print("Total acceptance rate: {}".format(total_acc_num / draft_token_num))
+    
+    # --- Print Timings ---
+    logging.info("--- Performance Timings (Average per Step) ---")
+    for key, values in timings.items():
+        if values:
+             avg_time = np.mean(values)
+             logging.info(f"{key}: {avg_time:.4f}s")
+        else:
+             logging.info(f"{key}: N/A (not run or no steps)")
+
+    return input_ids, new_token_num, idx + 1, accept_length_list #, draft_token_num
 
 def seed_everything(seed=64):
     random.seed(seed)
@@ -270,12 +319,6 @@ if __name__ == "__main__":
         required=True,
     )
     parser.add_argument(
-        "--data-num",
-        type=int,
-        default=10,
-        help="The number of samples.",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=2024,
@@ -298,7 +341,7 @@ if __name__ == "__main__":
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                        + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio))
-    answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}/{args.model_name}.jsonl"
+    answer_file = f"data/{args.bench_name}/model_answer/{args.model_name}.jsonl"
     set_logger()
 
     print(f"Output to {answer_file}")
@@ -307,8 +350,6 @@ if __name__ == "__main__":
     
     if args.answer_file:
         answer_file = args.answer_file
-    else:
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}.jsonl"
 
     torch.nn.Linear.reset_parameters = lambda x: None
 

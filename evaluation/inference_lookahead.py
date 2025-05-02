@@ -8,13 +8,13 @@ import argparse
 import os
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from fastchat.utils import str_to_torch_dtype
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from evaluation.eval import run_eval, reorg_answer_file
-
-from model.lade.utils import augment_all, config_lade
+from evaluation.eval import reorg_answer_file, run_eval
 from model.lade.decoding import CONFIG_MAP
+from model.lade.utils import augment_all, config_lade
+
 
 def lookahead_forward(inputs, model, tokenizer, max_new_tokens):
     input_ids = inputs.input_ids
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}.jsonl"
+        answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}-lade.jsonl"
 
     print(f"Output to {answer_file}")
 
