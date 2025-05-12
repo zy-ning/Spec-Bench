@@ -108,6 +108,9 @@ def clasp_verify(
     input_ids=None,
     past_key_values=None,
     position_ids=None,
+    use_cache=True,
+    output_hidden_states=True,
+    output_attentions=False,
 ):
     """
     Verify the clasp structure using the provided model and input.
@@ -129,6 +132,9 @@ def clasp_verify(
             attention_mask=None,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            use_cache=use_cache,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
         )
         orig = model.lm_head(outputs[0])
 
@@ -150,6 +156,12 @@ def sample(logits, logits_processor, k=1):
     - probabilities (torch.Tensor): Probabilities of all tokens.
     """
     logits = logits.view(-1, logits.size(-1))  # default batch size 1
+    if logits_processor is None: # greedy decoding
+        # sample_token = torch.argmax(logits[:, -1])
+        sample_token = torch.argmax(logits)
+        sample_token = sample_token[None, None]
+        return sample_token, None, None
+        
     logits = logits_processor(None, logits)
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
 
@@ -445,18 +457,18 @@ def CLaSp_Skip_Layer_Strategy_SeqParallel(L, M, hidden_states_H, model_layers, d
                     best_final_j = j_final
         if best_final_j != -1:
             current_j = best_final_j
-            logging.warning(
+            logging.infor(
                 f"CLaSp DP: Target skips M={M} not reached. Using best j={current_j} at final layer."
             )
         else:
-            logging.error(
+            logging.infor(
                 "CLaSp DP: No valid path found in DP table during backtracking."
             )
             return S
 
     while current_i > 0:
         if (current_i, current_j) not in parent:
-            logging.error(
+            logging.infor(
                 f"CLaSp DP: Backtracking error - state ({current_i}, {current_j}) has no parent."
             )
             break
@@ -468,7 +480,7 @@ def CLaSp_Skip_Layer_Strategy_SeqParallel(L, M, hidden_states_H, model_layers, d
     # Sanity check for number of skips
     actual_skips = torch.sum(S).item()
     if actual_skips > M:  # Check if backtracking selected more skips than allowed
-        logging.warning(
+        logging.info(
             f"CLaSp DP Backtracking resulted in {actual_skips} skips, but target was {M}. Check logic."
         )
         # Optional: Implement a correction mechanism if this happens, e.g., un-skip layers

@@ -26,6 +26,7 @@ from model.clasp.utils import (  # Ensure this points to your utils
     clasp_draft,
     clasp_verify,
     prepare_logits_processor,
+    sample,
     set_logger,
 )
 
@@ -45,6 +46,7 @@ def clasp_forward(
     CLaSp forward pass without tree-based speculative decoding.
     Uses autoregressive drafting with layer skipping and parallel verification.
     """
+    global steps_since_last_optim, current_draft_skip_mask, first_acc_rates
     input_ids = inputs.input_ids.cuda()
     device = input_ids.device
     batch_size = input_ids.shape[0]
@@ -56,7 +58,7 @@ def clasp_forward(
     accept_length_list = []
     L = model.config.num_hidden_layers
     M = int(L * args.skip_ratio)  # Number of layers to skip (M for CLaSp DP)
-    optim_interval_tokens = args.opt_interval
+    optim_interval_steps = args.opt_interval
     K = args.draft_length_K
     DET = args.draft_exit_threshold
     # Initialize KV cache for the verify model
@@ -75,13 +77,20 @@ def clasp_forward(
     start_prefill = time.time()
     # The model's forward should internally use/update the KVCache objects
     # when use_cache=True. Pass the list of KVCache objects.
+    
     prefill_outputs = model(
         input_ids=input_ids,
-        past_key_values=past_key_values,  # Pass the list of KVCache objects
-        use_cache=True,
+        past_key_values=past_key_values,  # Pass main cache list
         output_hidden_states=True,
     )
-    # logging.info(f"Prefill time: {time.time() - start_prefill:.4f}s")
+
+    prefill_token, _, _ = sample(prefill_outputs.logits, logits_processor)
+    logging.info(f"Prefill token: {prefill_token.item()}, str of token: {tokenizer.convert_ids_to_tokens(prefill_token.item())}")
+    # input_ids_list[0].append(prefill_token.item())
+    # next_draft_input_ids = prefill_token
+    # generated_token_count += 1
+    
+    logging.info(f"Prefill time: {time.time() - start_prefill:.4f}s")
     # After prefill, past_key_values_list and current_length_data should be updated automatically
     # by the KVCache.cat method called inside the model's forward pass.
     input_len = input_ids.shape[1]  # Current length is updated in current_length_data
@@ -91,8 +100,11 @@ def clasp_forward(
         last_token_hidden_states = [
             s[:, -1, :].squeeze(0) for s in prefill_outputs.hidden_states
         ]
-    current_draft_skip_mask = None
-    tokens_accepted_since_last_optim = 0
+    else:
+        logging.info(
+            "No hidden states available from prefill."
+        )
+    # tokens_accepted_since_last_optim = 0
 
     # --- Generation Loop ---
     timings = {
@@ -117,7 +129,7 @@ def clasp_forward(
         run_dp = False
         if last_token_hidden_states is not None and (
             current_draft_skip_mask is None
-            or tokens_accepted_since_last_optim >= optim_interval_tokens
+            or steps_since_last_optim >= optim_interval_steps
         ):
             start_dp = time.time()
             # logging.info(f"Running CLaSp DP Optimization at step {total_steps}...")
@@ -129,17 +141,20 @@ def clasp_forward(
                 device=device,
             )
             # logging.info("CLaSp DP Optimization: Layer to skip: ", current_draft_skip_mask)
-            tokens_accepted_since_last_optim = 0  # Reset counter
+            steps_since_last_optim = 0  # Reset counter
             logging.info(
                 f"CLaSp DP time: {time.time() - start_dp:.4f}s. Skipped {torch.sum(current_draft_skip_mask)} layers."
             )
+            logging.info(
+                f"Drafting with mask: {current_draft_skip_mask.int().cpu().tolist()}"
+            )
         elif last_token_hidden_states is None:
-            logging.warning(
+            logging.info(
                 f"Skipping CLaSp DP at step {total_steps}: No hidden states available."
             )
             # Fallback: Use no skips or previous mask? Let's use previous or None.
             if current_draft_skip_mask is None:
-                logging.warning(
+                logging.info(
                     "No skip mask calculated yet. Drafting with full model."
                 )
 
@@ -169,17 +184,16 @@ def clasp_forward(
         timings["draft_clone_kv"].append(clone_kv_end_time - start_draft)
 
         for draft_step_idx in range(K):
-            draft_i_start = time.time()
+            # draft_i_start = time.time()
             # Pass the draft KVCache list to the model during drafting
             with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
                 draft_outputs = model(  # Call the main model forward
                     input_ids=next_draft_input_ids,
                     past_key_values=draft_kv_cache_list,  # Use draft cache list
                     # past_key_values=past_key_values,
-                    # use_cache=True,
                     output_hidden_states=False,
                 )
-            draft_i_end_time = time.time()
+            # draft_i_end_time = time.time()
             # logging.info(
             #     f"Drafting foward step {draft_step_idx + 1} time: {draft_i_end_time - draft_i_start:.4f}s"
             # )
@@ -208,7 +222,7 @@ def clasp_forward(
             if next_token.item() == tokenizer.eos_token_id:
                 break
             
-            if len(draft_tokens) + generated_token_count >= max_new_tokens - 3:
+            if len(draft_tokens) + generated_token_count >= max_new_tokens - 2:
                 # logging.info(
                 #     f"Drafting stopped due to max new tokens limit ({max_new_tokens})."
                 # )
@@ -219,7 +233,7 @@ def clasp_forward(
         timings["draft_loop"].append(draft_loop_end_time - clone_kv_end_time)
         num_drafted = len(draft_tokens)
         timings["avg_draft_time"].append(
-            (draft_loop_end_time - start_draft) / num_drafted if num_drafted > 0 else 0
+            (draft_loop_end_time - clone_kv_end_time) / num_drafted if num_drafted > 0 else 0
         )
         # logging.info(
         #     f"Drafting time: {draft_loop_end_time - start_draft:.4f}s. Drafted {num_drafted} tokens."
@@ -232,18 +246,15 @@ def clasp_forward(
             0
         ].item()  # Get current length BEFORE verify
         if num_drafted > 0:
-            verify_input_list = [input_ids_list[0][-1]] + draft_tokens
+            verify_input_list = [next_draft_input_ids.item()] + draft_tokens
             verify_input_ids = torch.tensor([verify_input_list], device=device)
         else:  # No tokens drafted, generate one with full model
-            verify_input_ids = torch.tensor(
-                [input_ids_list[0][-1]], device=device
-            ).unsqueeze(0)
+            verify_input_ids = next_draft_input_ids
         # Run verification using the *full* model
         # Pass the main KVCache list
         verify_outputs = model(
             input_ids=verify_input_ids,
             past_key_values=past_key_values,  # Pass main cache list
-            # use_cache=True,  # This should update the main cache IN PLACE
             output_hidden_states=True,
             output_attentions=False,
         )
@@ -327,24 +338,26 @@ def clasp_forward(
             else:
                 last_accepted_token_hidden_states = None
 
+        first_acc_rates.append(1 if accepted_len > 0 else 0)
         # --- Update Sequence and KV Cache Length ---
         # Add accepted draft tokens to sequence
         input_ids_list[0].extend(draft_tokens[:accepted_len])
         # Add the final token (either mismatch or bonus)
         input_ids_list[0].append(final_next_token)
-        # Calculate the actual number of tokens added to the main KV cache by verify
-        # This depends on the length of verify_input_ids
-        verify_added_len = verify_input_ids.shape[1]
-        # Calculate how many steps to rollback in the main KV cache
-        rollback_steps = verify_added_len - (accepted_len + 1)
+        # # Calculate the actual number of tokens added to the main KV cache by verify
+        # # This depends on the length of verify_input_ids
+        # verify_added_len = verify_input_ids.shape[1]
+        # # Calculate how many steps to rollback in the main KV cache
+        # rollback_steps = verify_added_len - (accepted_len + 1)
         # Update the current_length_data tensor to reflect the true length
         new_len = current_seq_len + accepted_len + 1
         current_length_data.fill_(new_len)  # Set length for ALL layers
         # Total accepted tokens in this verify step
-        step_accept_len = accepted_len + 1
+        step_accept_len = accepted_len  # + 1
         accept_length_list.append(step_accept_len)
         generated_token_count += step_accept_len
-        tokens_accepted_since_last_optim += step_accept_len
+        steps_since_last_optim += 1
+        last_token_hidden_states = last_accepted_token_hidden_states
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - start_accept)
         # logging.info(
@@ -372,6 +385,7 @@ def clasp_forward(
     # )
     
     # --- Print Timings ---
+    logging.info(f"\ntotal_steps: {total_steps}")
     logging.info("--- Performance Timings (Average per Step) ---")
     for key, values in timings.items():
         if values:
@@ -564,6 +578,11 @@ if __name__ == "__main__":
         "opt_interval": args.opt_interval,
         "draft_exit_threshold": args.draft_exit_threshold,
     }
+    
+    current_draft_skip_mask = None
+    steps_since_last_optim = 0
+    first_acc_rates = []
+
 
     # --- Run Evaluation ---
     run_eval(
@@ -583,6 +602,8 @@ if __name__ == "__main__":
         logits_processor=logits_processor,
         args=args,  # Pass full args object to forward function
     )
+    
+    print("First acceptance rates:", np.mean(first_acc_rates))
 
     reorg_answer_file(answer_file)
     print("Evaluation finished.")

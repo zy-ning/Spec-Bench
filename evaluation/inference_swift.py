@@ -38,6 +38,7 @@ from model.swift.utils import (
     update_inference_inputs,
 )
 
+first_acc_rates = []
 
 def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
@@ -81,6 +82,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         # "dp_optim": [],
         # "draft_clone_kv": [],
         "draft_loop": [],
+        "avg_draft_time": [],
         "verify": [],
         "accept_update": [],
         "misc_overhead": [],
@@ -125,6 +127,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 logits, candidates, logits_processor, cart_candidates_prob, swift_logits[2],
                 swift_buffers["p_indices"], tree_candidates, swift_buffers["b_indices"]
             )
+        
+        if accept_length == 0:
+            first_acc_rates.append(0)
+        else:
+            first_acc_rates.append(1)
 
         input_ids, new_token_num, sample_token = update_inference_inputs(
             input_ids,
@@ -145,6 +152,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
                 and idx % statistics["opt_interval"] == 0):
+            logging.info("Swift optimization" + "-" * 10)
             swift_optimization(
                 model,
                 input_ids[:, input_len:],
@@ -169,7 +177,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         )
         
         draft_loop_end_time = time.time()
-        timings["draft_loop"].append(draft_loop_end_time - accept_update_end_time)
+        draft_time = draft_loop_end_time - accept_update_end_time
+        timings["draft_loop"].append(draft_time)
+        timings["avg_draft_time"].append(
+            draft_time / len(top1_prob)
+        )
 
         
         accept_length_tree = input_ids.shape[1] - cur_length
@@ -184,10 +196,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
         
-        
+    totoal_acc_rate = total_acc_num / draft_token_num
     # logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
-    print("Total acceptance rate: {}".format(total_acc_num / draft_token_num))
+    logging.info("Total acceptance rate: {}".format(totoal_acc_rate))
     
+    logging.info("total_steps: {}".format(idx))
     # --- Print Timings ---
     logging.info("--- Performance Timings (Average per Step) ---")
     for key, values in timings.items():
@@ -417,5 +430,7 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
+    
+    print("First acceptance rate: ", np.mean(first_acc_rates))
     
     reorg_answer_file(answer_file)

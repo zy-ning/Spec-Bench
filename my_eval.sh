@@ -4,7 +4,10 @@ MODEL_NAME=vicuna-${SIZE}b-v1.3
 Vicuna_PATH=/data/nzy/models/$MODEL_NAME
 
 TEMP=0.0
-GPU_DEVICES=4
+
+if [ -z "$GPU_DEVICES" ]; then
+    GPU_DEVICES=4
+fi
 
 SEED=2024
 MAX_NEW_TOKENS=1024
@@ -26,7 +29,7 @@ torch_dtype="float16" # ["float32", "float64", "float16", "bfloat16"]
 # MAX_TOLERANCE_ITER=300
 # MAX_SCORE=0.93
 # CONTEXT_WINDOW=50
-# SKIP_RATIO=0.55
+# SKIP_RATIO=0.4
 
 # CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_swift --model-path $Vicuna_PATH --model-id ${MODEL_NAME} \
 #   --temperature $TEMP --dtype $torch_dtype --bench-name $bench_NAME --max-new-tokens ${MAX_NEW_TOKENS} \
@@ -35,10 +38,10 @@ torch_dtype="float16" # ["float32", "float64", "float16", "bfloat16"]
 
 
 
-SKIP_RATIO=0.45
-OPT_INTERVAL=128
-DET=0.7
-DRAFT_LEN=4
+SKIP_RATIO=0.4
+OPT_INTERVAL=2048
+DET=0.3
+DRAFT_LEN=6
 
 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_clasp --model-path $Vicuna_PATH --model-id ${MODEL_NAME} \
     --temperature $TEMP --dtype $torch_dtype --bench-name $bench_NAME --max-new-tokens ${MAX_NEW_TOKENS} \

@@ -20,10 +20,9 @@ from transformers import (
 )
 
 from evaluation.eval import reorg_answer_file, run_eval
-from model.pld.pld import greedy_search_pld
-from model.swift.kv_cache import initialize_past_key_values
-from model.swift.modeling_llama import LlamaForCausalLM
-from model.swift.utils import (
+from model.myswift.kv_cache import initialize_past_key_values
+from model.myswift.modeling_llama import LlamaForCausalLM
+from model.myswift.utils import (
     evaluate_posterior,
     generate_candidates,
     generate_swift_buffers,
@@ -38,6 +37,7 @@ from model.swift.utils import (
     tree_decoding,
     update_inference_inputs,
 )
+from model.pld.pld import greedy_search_pld
 
 
 def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
@@ -340,10 +340,16 @@ if __name__ == "__main__":
         type=int,
         help="A debug option. The end index of questions."
     )
+    parser.add_argument(
+        "--no-tree",
+        action="store_true",
+        default=False,
+        help="Whether to use tree decoding.",
+    )
 
     args = parser.parse_args()
 
-    args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
+    args.model_name = (args.model_id + "-myswift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                        + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio))

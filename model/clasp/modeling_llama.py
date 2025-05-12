@@ -393,6 +393,7 @@ class LlamaModel(_LlamaModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        self.num_layers = len(self.layers)
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = True
@@ -549,9 +550,12 @@ class LlamaModel(_LlamaModel):
         is_drafting = getattr(
             self, "_is_drafting", False
         )  # Check if drafting context is active
-        dynamic_mask = getattr(self, "_draft_dynamic_skip_mask", None)  # Get CLaSp mask
+        dynamic_mask = None
+        if is_drafting:
+            dynamic_mask = getattr(self, "_draft_dynamic_skip_mask", None)  # Get CLaSp mask
 
-        for idx, decoder_layer in enumerate(self.layers):
+        # for idx, decoder_layer in enumerate(self.layers):
+        for idx in range(self.num_layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -562,6 +566,7 @@ class LlamaModel(_LlamaModel):
             # --- Layer Skipping Logic for CLaSp ---
             skip_this_layer = False
             if is_drafting and dynamic_mask is not None:
+                # print(idx, " ", len(dynamic_mask), " ", dynamic_mask)
                 # Use the CLaSp dynamic mask if present during drafting
                 if idx < len(dynamic_mask) and dynamic_mask[idx]:
                     skip_this_layer = True
@@ -573,6 +578,7 @@ class LlamaModel(_LlamaModel):
                 if output_attentions:  # Adjust tuple size if attentions are output
                     layer_outputs = (hidden_states, None, None, past_key_value)
             else:
+                decoder_layer = self.layers[idx]
                 # --- Execute Layer Normally (or with gradient checkpointing) ---
                 if self.gradient_checkpointing and self.training:
 
@@ -665,7 +671,7 @@ class LlamaForCausalLM(_LlamaForCausalLM):
     def self_draft(self, enabled=True, dynamic_skip_mask=None, *args, **kwds):
         # Using a model-level flag is generally better than global
         original_draft_state = getattr(self.model, "_is_drafting", False)
-        original_mask = getattr(self.model, "_draft_dynamic_skip_mask", None)
+        # original_mask = getattr(self.model, "_draft_dynamic_skip_mask", None)
 
         self.model._is_drafting = (
             enabled  # Set drafting state on the LlamaModel instance
@@ -678,7 +684,7 @@ class LlamaForCausalLM(_LlamaForCausalLM):
         finally:
             # Restore previous state cleanly
             self.model._is_drafting = original_draft_state
-            self.model._draft_dynamic_skip_mask = original_mask
+            self.model._draft_dynamic_skip_mask = None # original_mask
 
     def add_bitfit(self, dtype=torch.float):
         global enabled_bitfit
