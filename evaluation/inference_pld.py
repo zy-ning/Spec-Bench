@@ -19,7 +19,7 @@ from evaluation.eval import reorg_answer_file, run_eval
 from model.pld.pld import greedy_search_pld
 
 
-def pld_forward(inputs, model, tokenizer, max_new_tokens, fallback, use_csd_mgram):
+def pld_forward(inputs, model, tokenizer, max_new_tokens): #, fallback, use_csd_mgram
     input_ids = inputs.input_ids
     output_ids, idx, accept_length_list = model.greedy_search_pld(
         inputs.input_ids,
@@ -33,8 +33,8 @@ def pld_forward(inputs, model, tokenizer, max_new_tokens, fallback, use_csd_mgra
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         return_dict_in_generate=False,
-        fallback=fallback,
-        use_csd_mgram=use_csd_mgram,
+        # fallback=fallback,
+        # use_csd_mgram=use_csd_mgram,
     )
     input_len = len(input_ids[0])
     new_token = len(output_ids[0][input_len:])
@@ -100,17 +100,17 @@ if __name__ == "__main__":
         choices=["float32", "float64", "float16", "bfloat16"],
         help="Override the default dtype. If not set, it will use float16 on GPU.",
     )
-    parser.add_argument(
-        "--fallback",
-        type=str,
-        default="none",
-        choices=["none", "model", "data"],
-    )
-    parser.add_argument(
-        "--use-csd-mgram",
-        action="store_true",
-        help="Use max gram drafter to generate the answer.",
-    )
+    # parser.add_argument(
+    #     "--fallback",
+    #     type=str,
+    #     default="none",
+    #     choices=["none", "model", "data"],
+    # )
+    # parser.add_argument(
+    #     "--use-csd-mgram",
+    #     action="store_true",
+    #     help="Use max gram drafter to generate the answer.",
+    # )
 
     args = parser.parse_args()
 
@@ -148,8 +148,8 @@ if __name__ == "__main__":
         num_choices=args.num_choices,
         num_gpus_per_model=args.num_gpus_per_model,
         num_gpus_total=args.num_gpus_total,
-        fallback=args.fallback,
-        use_csd_mgram=args.use_csd_mgram,
+        # fallback=args.fallback,
+        # use_csd_mgram=args.use_csd_mgram,
     )
 
     reorg_answer_file(answer_file)

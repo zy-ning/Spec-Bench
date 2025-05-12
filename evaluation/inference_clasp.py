@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 # Assuming these are correctly adapted or available:
 from evaluation.eval import reorg_answer_file, run_eval
 from model.clasp.kv_cache import (
-    # clone_past_key_values,
+    clone_past_key_values,
     initialize_past_key_values,
 )
 from model.clasp.modeling_llama import (
@@ -81,7 +81,7 @@ def clasp_forward(
         use_cache=True,
         output_hidden_states=True,
     )
-    logging.info(f"Prefill time: {time.time() - start_prefill:.4f}s")
+    # logging.info(f"Prefill time: {time.time() - start_prefill:.4f}s")
     # After prefill, past_key_values_list and current_length_data should be updated automatically
     # by the KVCache.cat method called inside the model's forward pass.
     input_len = input_ids.shape[1]  # Current length is updated in current_length_data
@@ -120,7 +120,7 @@ def clasp_forward(
             or tokens_accepted_since_last_optim >= optim_interval_tokens
         ):
             start_dp = time.time()
-            logging.info(f"Running CLaSp DP Optimization at step {total_steps}...")
+            # logging.info(f"Running CLaSp DP Optimization at step {total_steps}...")
             current_draft_skip_mask = CLaSp_Skip_Layer_Strategy_SeqParallel(
                 L=L,
                 M=M,
@@ -150,16 +150,16 @@ def clasp_forward(
         # --- 2. Drafting (Autoregressive) ---
         start_draft = time.time()
         draft_tokens = []
-        # # Use a *cloned* KV cache structure for drafting
-        # # We need to clone the underlying data tensors and create new KVCache objects
-        # draft_past_key_values_data_list = [d.clone() for d in past_key_values_data_list]
-        # draft_current_length_data = (
-        #     current_length_data.clone()
-        # )  # This tracks lengths for the draft cache
-        # # Create new KVCache objects pointing to the *cloned* data
-        # draft_kv_cache_list = clone_past_key_values(
-        #     model, draft_past_key_values_data_list, draft_current_length_data
-        # )
+        # Use a *cloned* KV cache structure for drafting
+        # We need to clone the underlying data tensors and create new KVCache objects
+        draft_past_key_values_data_list = [d.clone() for d in past_key_values_data]
+        draft_current_length_data = (
+            current_length_data.clone()
+        )  # This tracks lengths for the draft cache
+        # Create new KVCache objects pointing to the *cloned* data
+        draft_kv_cache_list = clone_past_key_values(
+            model, draft_past_key_values_data_list, draft_current_length_data
+        )
 
         next_draft_input_ids = torch.tensor(
             [input_ids_list[0][-1]], device=device
@@ -174,15 +174,15 @@ def clasp_forward(
             with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
                 draft_outputs = model(  # Call the main model forward
                     input_ids=next_draft_input_ids,
-                    # past_key_values=draft_kv_cache_list,  # Use draft cache list
-                    past_key_values=past_key_values,
+                    past_key_values=draft_kv_cache_list,  # Use draft cache list
+                    # past_key_values=past_key_values,
                     # use_cache=True,
                     output_hidden_states=False,
                 )
             draft_i_end_time = time.time()
-            logging.info(
-                f"Drafting foward step {draft_step_idx + 1} time: {draft_i_end_time - draft_i_start:.4f}s"
-            )
+            # logging.info(
+            #     f"Drafting foward step {draft_step_idx + 1} time: {draft_i_end_time - draft_i_start:.4f}s"
+            # )
             draft_logits = draft_outputs.logits[:, -1, :]  # Logits for next token
             # draft_kv_cache_list is automatically updated by the forward pass
             # (DET check and sampling logic unchanged)
@@ -201,16 +201,17 @@ def clasp_forward(
             draft_tokens.append(next_token.item())
             next_draft_input_ids = next_token
             if top1_prob < DET and len(draft_tokens) > 0:
-                logging.info(
-                    f"Drafting stopped early at len {len(draft_tokens)} due to DET ({top1_prob:.3f} < {DET})"
-                )
+                # logging.info(
+                #     f"Drafting stopped early at len {len(draft_tokens)} due to DET ({top1_prob:.3f} < {DET})"
+                # )
                 break
             if next_token.item() == tokenizer.eos_token_id:
                 break
-            if len(draft_tokens) + generated_token_count >= max_new_tokens - 2:
-                logging.info(
-                    f"Drafting stopped due to max new tokens limit ({max_new_tokens})."
-                )
+            
+            if len(draft_tokens) + generated_token_count >= max_new_tokens - 3:
+                # logging.info(
+                #     f"Drafting stopped due to max new tokens limit ({max_new_tokens})."
+                # )
                 break
         
         # --- End Drafting Loop ---
@@ -220,9 +221,9 @@ def clasp_forward(
         timings["avg_draft_time"].append(
             (draft_loop_end_time - start_draft) / num_drafted if num_drafted > 0 else 0
         )
-        logging.info(
-            f"Drafting time: {draft_loop_end_time - start_draft:.4f}s. Drafted {num_drafted} tokens."
-        )
+        # logging.info(
+        #     f"Drafting time: {draft_loop_end_time - start_draft:.4f}s. Drafted {num_drafted} tokens."
+        # )
 
         # --- 3. Verification (Parallel) ---
         start_verify = time.time()
@@ -250,8 +251,8 @@ def clasp_forward(
         verify_hidden_states = verify_outputs.hidden_states
         verify_end_time = time.time()
         timings["verify"].append(verify_end_time - start_verify)
-        logging.info(f"Verification time: {verify_end_time - start_verify:.4f}s.")
-        # NOTE: verify_kv_cache_list (past_key_values_list) is now updated by verify step
+        # logging.info(f"Verification time: {verify_end_time - start_verify:.4f}s.")
+        # NOTE: verify_kv_cache_list (past_key_values) is now updated by verify step
 
         # --- 4. Acceptance & Update ---
         start_accept = time.time()
@@ -346,18 +347,18 @@ def clasp_forward(
         tokens_accepted_since_last_optim += step_accept_len
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - start_accept)
-        logging.info(
-            f"Acceptance time: {time.time() - start_accept:.4f}s. Accepted {step_accept_len} tokens. Rolled back {rollback_steps} KV entries."
-        )
-        logging.info(
-            f"Step {total_steps} time: {time.time() - start_step:.4f}s | Accepted: {step_accept_len} | Total Gen: {generated_token_count}"
-        )
+        # logging.info(
+        #     f"Acceptance time: {time.time() - start_accept:.4f}s. Accepted {step_accept_len} tokens. Rolled back {rollback_steps} KV entries."
+        # )
+        # logging.info(
+        #     f"Step {total_steps} time: {time.time() - start_step:.4f}s | Accepted: {step_accept_len} | Total Gen: {generated_token_count}"
+        # )
         
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
         # --- Check for EOS ---
         if tokenizer.eos_token_id == final_next_token:
-            logging.info("EOS token generated. Stopping.")
+            # logging.info("EOS token generated. Stopping.")
             break
 
     # --- Final Output ---
@@ -366,9 +367,9 @@ def clasp_forward(
         [input_ids_list[0][input_len:]], device=device
     )  # Generated part
     avg_accept_len = np.mean(accept_length_list) if accept_length_list else 0
-    logging.info(
-        f"Finished. Total steps: {total_steps}, Total generated: {generated_token_count}, Avg accept/step: {avg_accept_len:.2f}"
-    )
+    # logging.info(
+    #     f"Finished. Total steps: {total_steps}, Total generated: {generated_token_count}, Avg accept/step: {avg_accept_len:.2f}"
+    # )
     
     # --- Print Timings ---
     logging.info("--- Performance Timings (Average per Step) ---")

@@ -149,8 +149,8 @@ def greedy_search_pld(
         streamer: Optional["BaseStreamer"] = None,
         draft_matching_window_size=3,
         draft_num_candidate_tokens=10,
-        fallback="none",
-        use_csd_mgram=False,
+        # fallback="none",
+        # use_csd_mgram=False,
         **model_kwargs,
 ):
     global tokenizer
@@ -180,53 +180,52 @@ def greedy_search_pld(
     # # init attention / hidden states / scores tuples
     scores = () if (return_dict_in_generate and output_scores) else None
 
-    bi_gram_model = None
-    bi_gram_path = None
-    if fallback.lower() == "none":
-        fallback = None
-    elif fallback.lower() == "data":
-        bi_gram_path = "/gemini/user/private/my/CS-Drafting/bigram_models/wiki_bigram_naive_bayers_greedy_llama_next_token.json"
-    elif fallback.lower() == "model":
-        bi_gram_path = "/gemini/user/private/my/Spec-Bench/data/model_bigram/bigram_mapping.json"
+    # bi_gram_model = None
+    # bi_gram_path = None
+    # if fallback.lower() == "none":
+    #     fallback = None
+    # elif fallback.lower() == "data":
+    #     bi_gram_path = "/gemini/user/private/my/CS-Drafting/bigram_models/wiki_bigram_naive_bayers_greedy_llama_next_token.json"
+    # elif fallback.lower() == "model":
+    #     bi_gram_path = "/gemini/user/private/my/Spec-Bench/data/model_bigram/bigram_mapping.json"
     
-    if bi_gram_path is not None:
-        with open(bi_gram_path, "r") as f:
-            bi_gram_model = json.load(f)
-        bi_gram_model = torch.tensor(bi_gram_model)
-        bi_gram_model = bi_gram_model.to(input_ids.device)
+    # if bi_gram_path is not None:
+    #     with open(bi_gram_path, "r") as f:
+    #         bi_gram_model = json.load(f)
+    #     bi_gram_model = torch.tensor(bi_gram_model)
+    #     bi_gram_model = bi_gram_model.to(input_ids.device)
 
     max_len = stopping_criteria[0].max_length
 
     step = 0
     accept_length_list = []
     initial_input_ids = input_ids.clone()
-    initial_input_ids = input_ids.clone()
     while True:
         step += 1
         cur_len = input_ids.shape[-1]
         
-        if use_csd_mgram:
-             # Use draft_sample_k_bn_gram to generate candidate input_ids
-             candidate_input_ids = draft_sample_k_bn_gram(
-                 initial_input_ids,
-                 input_ids,
-                 draft_num_candidate_tokens,
-                 bi_gram_model
-             )
+        # if use_csd_mgram:
+        #      # Use draft_sample_k_bn_gram to generate candidate input_ids
+        #      candidate_input_ids = draft_sample_k_bn_gram(
+        #          initial_input_ids,
+        #          input_ids,
+        #          draft_num_candidate_tokens,
+        #          bi_gram_model
+        #      )
+        # else:
+        # Use find_candidate_pred_tokens for candidate generation
+        candidate_pred_tokens = find_candidate_pred_tokens(input_ids, draft_matching_window_size,
+                                                            draft_num_candidate_tokens)
+
+        if len(candidate_pred_tokens) == 0:
+            # Handle case where no candidate tokens are found (e.g., generate a default token or handle differently)
+            # Using a default token [100] as in the original code for now.
+            candidate_pred_tokens = torch.tensor([100], device=input_ids.device).unsqueeze(0)
         else:
-            # Use find_candidate_pred_tokens for candidate generation
-            candidate_pred_tokens = find_candidate_pred_tokens(input_ids, draft_matching_window_size,
-                                                               draft_num_candidate_tokens)
+            candidate_pred_tokens = candidate_pred_tokens.unsqueeze(0)
 
-            if len(candidate_pred_tokens) == 0:
-                # Handle case where no candidate tokens are found (e.g., generate a default token or handle differently)
-                # Using a default token [100] as in the original code for now.
-                candidate_pred_tokens = torch.tensor([100], device=input_ids.device).unsqueeze(0)
-            else:
-                candidate_pred_tokens = candidate_pred_tokens.unsqueeze(0)
-
-            candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
-            candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
+        candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
+        candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
 
         candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
 

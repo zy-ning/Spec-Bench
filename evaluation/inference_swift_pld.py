@@ -20,6 +20,7 @@ from transformers import (
 )
 
 from evaluation.eval import reorg_answer_file, run_eval
+from model.pld.pld import greedy_search_pld
 from model.swift.kv_cache import initialize_past_key_values
 from model.swift.modeling_llama import LlamaForCausalLM
 from model.swift.utils import (
@@ -382,7 +383,8 @@ if __name__ == "__main__":
         _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
-
+    
+    model.greedy_search_pld = greedy_search_pld.__get__(model, type(model))
 
     seed_everything(args.seed)
     # Bayes Optimization Settings
