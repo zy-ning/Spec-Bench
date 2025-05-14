@@ -192,6 +192,9 @@ class LlamaAttention(_LlamaAttention):
             # reuse k, v, self_attention
             key_states = past_key_value[0].cat(key_states, dim=2)
             value_states = past_key_value[1].cat(value_states, dim=2)
+            # key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            # value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
 
         past_key_value = (key_states, value_states) if use_cache else None
 
@@ -281,8 +284,8 @@ class LlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        draft_attn_skip_mask: torch.Tensor = None,
-        draft_mlp_skip_mask: torch.Tensor = None,
+        # draft_attn_skip_mask: torch.Tensor = None,
+        # draft_mlp_skip_mask: torch.Tensor = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[
@@ -513,6 +516,20 @@ class LlamaModel(_LlamaModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
+            # if torch.any(input_ids >= self.vocab_size) or torch.any(input_ids < 0):
+            #     # Get indices of out-of-range tokens
+            #     invalid_indices = torch.logical_or(input_ids >= self.vocab_size, input_ids < 0)
+            #     num_invalid = torch.sum(invalid_indices).item()
+                
+            #     # Log warning
+            #     logger.warning(
+            #         f"Found {num_invalid} token IDs outside of vocabulary range [0, {self.vocab_size-1}]. "
+            #         f"Clamping to valid range."
+            #     )
+                
+            #     # Clamp token IDs to valid range
+            #     input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
+            
             inputs_embeds = self.embed_tokens(input_ids)
         # embed positions
         if attention_mask is None:
@@ -566,7 +583,6 @@ class LlamaModel(_LlamaModel):
             # --- Layer Skipping Logic for CLaSp ---
             skip_this_layer = False
             if is_drafting and dynamic_mask is not None:
-                # print(idx, " ", len(dynamic_mask), " ", dynamic_mask)
                 # Use the CLaSp dynamic mask if present during drafting
                 if idx < len(dynamic_mask) and dynamic_mask[idx]:
                     skip_this_layer = True
@@ -676,15 +692,16 @@ class LlamaForCausalLM(_LlamaForCausalLM):
         self.model._is_drafting = (
             enabled  # Set drafting state on the LlamaModel instance
         )
-        self.model._draft_dynamic_skip_mask = (
-            dynamic_skip_mask  # Store the dynamic mask there
-        )
+        if len(dynamic_skip_mask) == self.model.num_layers:
+            self.model._draft_dynamic_skip_mask = (
+                dynamic_skip_mask  # Store the dynamic mask there
+            )
         try:
             yield None # Execute code within the 'with' block
         finally:
             # Restore previous state cleanly
             self.model._is_drafting = original_draft_state
-            self.model._draft_dynamic_skip_mask = None # original_mask
+            # self.model._draft_dynamic_skip_mask = None # original_mask
 
     def add_bitfit(self, dtype=torch.float):
         global enabled_bitfit

@@ -1,3 +1,4 @@
+cat my_eval.sh
 SIZE=7
 
 MODEL_NAME=vicuna-${SIZE}b-v1.3
@@ -38,14 +39,14 @@ torch_dtype="float16" # ["float32", "float64", "float16", "bfloat16"]
 
 
 
-SKIP_RATIO=0.4
-OPT_INTERVAL=2048
+SKIP_RATIO=0.45
+OPT_INTERVAL_STEPS=128
 DET=0.3
-DRAFT_LEN=6
+DRAFT_LEN=5
 
 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_clasp --model-path $Vicuna_PATH --model-id ${MODEL_NAME} \
     --temperature $TEMP --dtype $torch_dtype --bench-name $bench_NAME --max-new-tokens ${MAX_NEW_TOKENS} \
-    --seed $SEED --skip-ratio $SKIP_RATIO --opt-interval $OPT_INTERVAL --draft-exit-threshold $DET --draft-length-K $DRAFT_LEN
+    --seed $SEED --skip-ratio $SKIP_RATIO --opt-interval $OPT_INTERVAL_STEPS --draft-exit-threshold $DET --draft-length-K $DRAFT_LEN
 
 
 # echo "PLD"
@@ -75,5 +76,14 @@ CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation.inference_clasp --model
 echo "CLASP"
 python evaluation/speed.py \
     --base-path data/spec_bench/model_answer/vicuna-${SIZE}b-v1.3-vanilla-float16-temp-0.0.jsonl \
-    --file-path data/spec_bench/model_answer/vicuna-${SIZE}b-v1.3-clasp-float16-temp-0.0-topp-0.85-seed-2024-maxntok-1024-I${OPT_INTERVAL}-DET${DET}-skip${SKIP_RATIO}.jsonl \
+    --file-path data/spec_bench/model_answer/vicuna-${SIZE}b-v1.3-clasp-float16-temp-0.0-topp-0.85-seed-2024-maxntok-1024-I${OPT_INTERVAL_STEPS}-K${DRAFT_LEN}-DET${DET}-skip${SKIP_RATIO}.jsonl \
     --tokenizer-path $Vicuna_PATH
+
+# python evaluation/equal.py \
+#     --file-path data/spec_bench/model_answer/ \
+#     --jsonfile1 vicuna-${SIZE}b-v1.3-vanilla-float16-temp-0.0.jsonl \
+#     --jsonfile2 vicuna-${SIZE}b-v1.3-pld-float16.jsonl
+    # --jsonfile2 vicuna-${SIZE}b-v1.3-clasp-float16-temp-0.0-topp-0.85-seed-2024-maxntok-1024-I${OPT_INTERVAL}-DET${DET}-skip${SKIP_RATIO}.jsonl
+
+
+

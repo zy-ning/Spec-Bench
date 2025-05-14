@@ -209,6 +209,10 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
              logging.info(f"{key}: {avg_time:.4f}s")
         else:
              logging.info(f"{key}: N/A (not run or no steps)")
+    logging.info(f"Average Acceptance Length: {np.mean(accept_length_list) - 1:.4f}")
+    logging.info(
+        f"Finished. Total steps: {idx}, Total generated: {new_token_num}"
+    )
 
     return input_ids, new_token_num, idx + 1, accept_length_list #, draft_token_num
 
