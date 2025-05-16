@@ -23,13 +23,13 @@ from model.clasp.utils import (  # Ensure this points to your utils
     CLaSp_Skip_Layer_Strategy_SeqParallel,  # The core DP algorithm
     # cosine_similarity,  # Helper for DP if needed outside
     # normalize_tensor,  # Helper for DP if needed outside
-    clasp_draft,
-    clasp_skip_layer_strategy,
-    clasp_verify,
     prepare_logits_processor,
     sample,
     set_logger,
 )
+
+# Import pld
+from model.pld.pld import find_candidate_pred_tokens
 
 
 @torch.no_grad()
@@ -64,9 +64,8 @@ def clasp_forward(
     optim_interval_steps = args.opt_interval
     K = args.draft_length_K
     DET = args.draft_exit_threshold
-    logging.info(
-        f"Drafting with K={K}, DET={DET}, M={M} out of {L} layers, Optim Interval={optim_interval_steps}"
-    )
+    HC = args.hc
+    VC = args.vc
     # Initialize KV cache for the verify model
     # ! initialize_past_key_values now returns:
     # past_key_values (List[List[KVCache]]),
@@ -133,7 +132,6 @@ def clasp_forward(
     timings = {
         "total_step": [],
         "dp_optim": [],
-        "draft_clone_kv": [],
         "draft_loop": [],
         "avg_draft_time": [],
         "verify": [],
@@ -146,8 +144,8 @@ def clasp_forward(
         total_steps += 1
         start_step = time.time()
         timings["misc_overhead"].append(start_step - step_end_time)
-        # --- 1. Layer Optimization (Run periodically) ---
 
+        # --- 1. Layer Optimization (Run periodically) ---
         dp_start_time = time.time()
         run_dp = False
         if last_token_hidden_states is not None and (
@@ -189,14 +187,6 @@ def clasp_forward(
                 "accepted_len": [],
                 "draft_len": [],
             }
-        elif last_token_hidden_states is None:
-            logging.info(
-                f"Skipping CLaSp DP at step {total_steps}: No hidden states available."
-            )
-            # Fallback: Use no skips or previous mask? Let's use previous or None.
-            if current_draft_skip_mask is None:
-                logging.info("No skip mask calculated yet. Drafting with full model.")
-
         dp_end_time = time.time()
         if run_dp:
             timings["dp_optim"].append(dp_end_time - dp_start_time)
@@ -220,9 +210,7 @@ def clasp_forward(
         ).unsqueeze(0)
         next_draft_input_ids = first_draft_input_ids
 
-        clone_kv_end_time = time.time()
-        timings["draft_clone_kv"].append(clone_kv_end_time - start_draft)
-
+        continue_hc = True
         for draft_step_idx in range(K):
             # logging.info(f"token count: {len(draft_tokens) + generated_token_count}")
             # draft_i_start = time.time()
@@ -256,29 +244,37 @@ def clasp_forward(
             draft_tokens.append(next_token.item())
             next_draft_input_ids = next_token
             if top1_prob < DET and len(draft_tokens) > 0:
-                # logging.info(
-                #     f"Drafting stopped early at len {len(draft_tokens)} due to DET ({top1_prob:.3f} < {DET})"
-                # )
                 break
+
             if next_token.item() == tokenizer.eos_token_id:
+                continue_hc = False
                 break
 
             if len(draft_tokens) + generated_token_count >= max_new_tokens - 2:
-                # logging.info(
-                #     f"Drafting stopped due to max new tokens limit ({max_new_tokens})."
-                # )
+                continue_hc = False
                 break
+        # PLD HC
+        if HC and continue_hc:
+            all_ids = torch.tensor(
+                [input_ids_list[0] + draft_tokens], device=device
+            )
+            max_new_draft = max_new_tokens - len(draft_tokens) - generated_token_count -2
+            pld_candidate_tokens = find_candidate_pred_tokens(
+                all_ids,
+                max_ngram_size=3,
+                num_pred_tokens=min(10, max_new_draft),
+            )
+            draft_tokens += pld_candidate_tokens.tolist()
+        
         if see_token:
             logging.info(
                 f"Drafted tokens: {draft_tokens}, str of tokens: {[tokenizer.convert_ids_to_tokens(t) for t in draft_tokens]}"
             )
-
-        # --- End Drafting Loop ---
         draft_loop_end_time = time.time()
-        timings["draft_loop"].append(draft_loop_end_time - clone_kv_end_time)
+        timings["draft_loop"].append(draft_loop_end_time - start_draft)
         num_drafted = len(draft_tokens)
         timings["avg_draft_time"].append(
-            (draft_loop_end_time - clone_kv_end_time) / num_drafted
+            (draft_loop_end_time - start_draft) / num_drafted
             if num_drafted > 0
             else 0
         )
@@ -344,16 +340,6 @@ def clasp_forward(
                 # # Accept draft token
                 accepted_len += 1
                 continue
-                # # Hidden states correspond to the token *producing* this prediction (index k)
-                # if verify_hidden_states:
-                #     try:
-                #         last_accepted_token_hidden_states = [
-                #             s[:, verify_k, :].squeeze(0) for s in verify_hidden_states
-                #         ]
-                #     except IndexError:
-                #         last_accepted_token_hidden_states = None
-                # else:
-                #     last_accepted_token_hidden_states = None
             else:
                 # Mismatch: Need to rollback KV cache and accept verify_token_k
                 final_next_token = verify_token_k
@@ -392,8 +378,8 @@ def clasp_forward(
                     last_accepted_token_hidden_states = None
             else:
                 last_accepted_token_hidden_states = None
-
-        first_acc_rates.append(1 if accepted_len > 0 else 0)
+        if num_drafted > 0:
+            first_acc_rates.append(1 if accepted_len > 0 else 0)
 
         # --- Update Sequence and KV Cache Length ---
         # Add accepted draft tokens to sequence
@@ -429,23 +415,15 @@ def clasp_forward(
         last_token_hidden_states = last_accepted_token_hidden_states
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - start_accept)
-        # # Calculate the actual number of tokens added to the main KV cache by verify
-        # # This depends on the length of verify_input_ids
-        # verify_added_len = verify_input_ids.shape[1]
-        # # Calculate how many steps to rollback in the main KV cache
-        # rollback_steps = verify_added_len - (accepted_len + 1)
-        # logging.info(
-        #     f"Acceptance time: {time.time() - start_accept:.4f}s. Accepted {step_accept_len} tokens. Rolled back {rollback_steps} KV entries."
-        # )
-        # logging.info(
-        #     f"Step {total_steps} time: {time.time() - start_step:.4f}s | Accepted: {step_accept_len} | Total Gen: {generated_token_count}"
-        # )
+
 
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
         # --- Check for EOS ---
-        if tokenizer.eos_token_id == final_next_token:
-            # logging.info("EOS token generated. Stopping.")
+        if tokenizer.eos_token_id in input_ids_list[0][-step_accept_len:]:
+            # logging.info(
+            #     f"EOS token found in generated sequence. Stopping generation at step {total_steps}."
+            # )
             break
 
     # --- Final Output ---
@@ -485,8 +463,6 @@ def seed_everything(seed=64):
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # --- Keep essential args from SWIFT ---
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-path",
@@ -581,6 +557,18 @@ if __name__ == "__main__":
         default=8,
         help="Maximum number of tokens to draft in each step (K).",
     )
+    parser.add_argument(
+        "-hc",
+        action="store_true",
+        default=False,
+        help="Use the Hrizontal Cascase with PLD for CLaSp.",
+    )
+    parser.add_argument(
+        "-vc",
+        action="store_true",
+        default=False,
+        help="Use the Vertical Cascade with PLD for CLaSp.",
+    )
 
     args = parser.parse_args()
 
@@ -600,6 +588,8 @@ if __name__ == "__main__":
         + f"-K{args.draft_length_K}"
         + f"-DET{args.draft_exit_threshold}"
         + f"-skip{args.skip_ratio}"
+        + "-hc" * args.hc
+        + "-vc" * args.vc
     )  # Include CLaSp params
     answer_file = f"data/{args.bench_name}/model_answer/{args.model_name}.jsonl"
     set_logger()  # Assuming set_logger is in clasp_utils or imported
@@ -669,7 +659,7 @@ if __name__ == "__main__":
         question_end=args.question_end,
         answer_file=answer_file,
         max_new_tokens=args.max_new_tokens,
-        num_choices=args.num_choices,  # CLaSp paper doesn't mention multiple choices
+        num_choices=args.num_choices,
         num_gpus_per_model=args.num_gpus_per_model,
         num_gpus_total=args.num_gpus_total,
         statistics=statistics,  # Pass simplified stats if needed

@@ -225,7 +225,6 @@ def greedy_search_pld(
             candidate_pred_tokens = candidate_pred_tokens.unsqueeze(0)
 
         candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
-        candidate_input_ids = torch.cat((input_ids, candidate_pred_tokens), dim=1)
 
         candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
 
@@ -261,9 +260,9 @@ def greedy_search_pld(
         selected_tokens = new_logits.argmax(dim=-1)
         candidate_new_tokens = candidate_input_ids[:, -candidate_length:]
         if candidate_length > 0:
-             n_matches = ((~(candidate_new_tokens == selected_tokens[:,:-1])).cumsum(dim=-1) < 1).sum()
+            n_matches = ((~(candidate_new_tokens == selected_tokens[:,:-1])).cumsum(dim=-1) < 1).sum()
         else:
-             n_matches = 0
+            n_matches = 0
 
         n_matches = min(n_matches, max_len - cur_len - 1)
         accept_rate = n_matches / candidate_length if candidate_length > 0 else 0

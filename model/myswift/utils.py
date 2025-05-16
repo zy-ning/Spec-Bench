@@ -18,6 +18,7 @@ from .kv_cache import clone_past_key_values
 
 TOPK = 10  # topk for sparse tree
 
+
 def set_logger(log_path=None):
     """Set the logger to log info in terminal and file `log_path`.
     In general, it is useful to have a logger so that every output to the terminal is saved
@@ -36,16 +37,20 @@ def set_logger(log_path=None):
         # Logging to a file
         if log_path:
             file_handler = logging.FileHandler(log_path)
-            file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s: %(message)s'))
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s:%(levelname)s: %(message)s")
+            )
             logger.addHandler(file_handler)
 
         # Logging to console
         stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(logging.Formatter('%(message)s'))
+        stream_handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(stream_handler)
 
 
-def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13b', task_name='cnndm'):
+def get_cache_configuration(
+    file_name="skip_layers.json", model_name="llama-2-13b", task_name="cnndm"
+):
     """
     Get the cached SWIFT configuration for LLM acceleration.
     """
@@ -54,12 +59,15 @@ def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13
         return None
     with open(file_name) as f:
         data = json.load(f)
-        if f'{model_name}_{task_name}' not in data.keys():
+        if f"{model_name}_{task_name}" not in data.keys():
             print("Configuration not found in cache.")
             return None
         else:
             print(f"Use cached configuration in {file_name}.")
-            return data[f'{model_name}_{task_name}']['attention'], data[f'{model_name}_{task_name}']['mlp']
+            return data[f"{model_name}_{task_name}"]["attention"], data[
+                f"{model_name}_{task_name}"
+            ]["mlp"]
+
 
 def get_choices_list(prob_list, logits_processor=None):
     """
@@ -86,14 +94,17 @@ def get_choices_list(prob_list, logits_processor=None):
             candidate_num = candidate_set[2]
         else:
             candidate_num = candidate_set[3]
-        choices_list.extend([[0]*idx + [i] for i in range(candidate_num)])
+        choices_list.extend([[0] * idx + [i] for i in range(candidate_num)])
     return choices_list
 
+def get_choices_list_notree(prob_list, logits_processor=None):
+    return [[0] for _ in prob_list]
+
 def prepare_logits_processor(
-        temperature: float = 0.0,
-        repetition_penalty: float = 0.0,
-        top_p: float = 0.0,
-        top_k: int = 0
+    temperature: float = 0.0,
+    repetition_penalty: float = 0.0,
+    top_p: float = 0.0,
+    top_k: int = 0,
 ) -> LogitsProcessorList:
     """
     Prepare the logits processor based on the provided parameters.
@@ -185,7 +196,9 @@ def generate_swift_buffers(swift_choices, device="cuda"):
                 continue
             ancestor_idx = []
             for c in range(len(cur_swift_choice) - 1):
-                ancestor_idx.append(sorted_swift_choices.index(cur_swift_choice[:c + 1]) + 1)
+                ancestor_idx.append(
+                    sorted_swift_choices.index(cur_swift_choice[: c + 1]) + 1
+                )
             swift_attn_mask[j + start + 1, ancestor_idx] = 1
         start += depth_counts[i]
 
@@ -213,7 +226,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     swift_position_ids = torch.zeros(swift_len, dtype=torch.long)
     start = 0
     for i in range(len(depth_counts)):
-        swift_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
+        swift_position_ids[start + 1 : start + depth_counts[i] + 1] = i + 1
         start += depth_counts[i]
 
     # Generate retrieval indices for swift structure verification
@@ -226,15 +239,22 @@ def generate_swift_buffers(swift_choices, device="cuda"):
             continue
         else:
             for c in range(len(cur_swift_choice)):
-                retrieve_indice.append(sorted_swift_choices.index(cur_swift_choice[:c + 1]))
-                retrieve_paths.append(cur_swift_choice[:c + 1])
+                retrieve_indice.append(
+                    sorted_swift_choices.index(cur_swift_choice[: c + 1])
+                )
+                retrieve_paths.append(cur_swift_choice[: c + 1])
         retrieve_indices_nest.append(retrieve_indice)
     max_length = max([len(x) for x in retrieve_indices_nest])
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
     retrieve_indices = retrieve_indices + 1
-    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices],
-                                 dim=1)
+    retrieve_indices = torch.cat(
+        [
+            torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long),
+            retrieve_indices,
+        ],
+        dim=1,
+    )
 
     maxitem = retrieve_indices.max().item() + 5
 
@@ -292,7 +312,15 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     return swift_buffers
 
 
-def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data, logits_processor=None):
+def initialize_swift(
+    input_ids,
+    model,
+    max_new_tokens,
+    past_key_values,
+    past_key_values_data,
+    current_length_data,
+    logits_processor=None,
+):
     """
     Initializes the swift structure for a given model.
 
@@ -315,7 +343,9 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
     """
     with torch.inference_mode():
         # Pass input through the base model
-        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        outputs, logits = swift_verify(
+            model, input_ids, past_key_values=past_key_values
+        )
         # Obtain the logits from the full model
         if logits_processor is not None:
             last_logits = logits[:, -1]
@@ -338,10 +368,10 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
 
 
 def swift_verify(
-        model,
-        input_ids=None,
-        past_key_values=None,
-        position_ids=None,
+    model,
+    input_ids=None,
+    past_key_values=None,
+    position_ids=None,
 ):
     """
     Verify the swift structure using the provided model and input.
@@ -383,7 +413,7 @@ def sample(logits, logits_processor, k=1):
     - sampled_probs (torch.Tensor): Probabilities of the sampled tokens.
     - probabilities (torch.Tensor): Probabilities of all tokens.
     """
-    logits = logits.view(-1, logits.size(-1)) # default batch size 1
+    logits = logits.view(-1, logits.size(-1))  # default batch size 1
     logits = logits_processor(None, logits)
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
 
@@ -392,7 +422,12 @@ def sample(logits, logits_processor, k=1):
 
     cumulative_sum = torch.cumsum(sampled_probs, dim=-1)
     cumulative_sum = torch.cat(
-        (torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device), cumulative_sum[:, :-1]), dim=-1)
+        (
+            torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device),
+            cumulative_sum[:, :-1],
+        ),
+        dim=-1,
+    )
 
     sampled_probs = sampled_probs / (1 - cumulative_sum)
     sampled_probs[torch.isinf(sampled_probs)] = -1
@@ -405,16 +440,17 @@ def sample(logits, logits_processor, k=1):
 
 @torch.no_grad()
 def swift_draft(
-        model,
-        input_ids=None,
-        new_token_num=0,
-        past_key_values_data=None,
-        current_length_data=None,
-        max_new_tokens=1024,
-        position_ids=None,
-        max_step_draft=25,
-        logits_processor=None,
-        stop_threshold=0.8,
+    model,
+    input_ids=None,
+    new_token_num=0,
+    past_key_values_data=None,
+    current_length_data=None,
+    max_new_tokens=1024,
+    position_ids=None,
+    max_step_draft=25,
+    logits_processor=None,
+    # stop_threshold=0.8,
+    stop_threshold=0.5,
 ):
     """
     Draft new tokens using the swift structure.
@@ -439,7 +475,9 @@ def swift_draft(
     for i in range(len(past_key_values_data)):
         draft_past_key_values_data.append(past_key_values_data[i].clone())
     draft_current_length_data = current_length_data.clone()
-    draft_past_key_values = clone_past_key_values(model, draft_past_key_values_data, draft_current_length_data)
+    draft_past_key_values = clone_past_key_values(
+        model, draft_past_key_values_data, draft_current_length_data
+    )
 
     ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
     with torch.inference_mode():
@@ -453,7 +491,9 @@ def swift_draft(
                 )
             current_draft_logits = model.lm_head(draft_outputs[0])
             if logits_processor is not None:
-                topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
+                topk_index, topk_prob, op = sample(
+                    current_draft_logits, logits_processor, k=TOPK
+                )
                 input_ids = topk_index[:, 0].unsqueeze(0)
             else:
                 top = torch.topk(current_draft_logits, TOPK, dim=-1)
@@ -464,16 +504,21 @@ def swift_draft(
             ss_prob.append(topk_prob)
             ss_op.append(op)
             origin_draft_probs = current_draft_logits.softmax(-1)
-            argmax_prob = torch.gather(origin_draft_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
+            argmax_prob = torch.gather(
+                origin_draft_probs, -1, input_ids.unsqueeze(-1)
+            ).squeeze(-1)
             current_threshold = argmax_prob.item()
             top1_prob.append(current_threshold)
-            if current_threshold < stop_threshold or new_token_num + step_draft + 2 >= max_new_tokens:
+            if (
+                current_threshold < stop_threshold
+                or new_token_num + step_draft + 2 >= max_new_tokens
+            ):
                 break
     return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
 
 
 def reset_swift_mode(
-        model,
+    model,
 ):
     """
     Resets the swift settings to their initial state.
@@ -504,7 +549,9 @@ def reset_past_key_values(past_key_values):
     return past_key_values
 
 
-def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor):
+def generate_candidates(
+    swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor
+):
     """
     Generate candidates based on provided logits and indices.
 
@@ -533,7 +580,13 @@ def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_tok
     tree_candidates = candidates[tree_indices]
 
     # Extend the tree candidates by appending a zero.
-    tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
+    tree_candidates_ext = torch.cat(
+        [
+            tree_candidates,
+            torch.zeros((1), dtype=torch.long, device=tree_candidates.device),
+        ],
+        dim=0,
+    )
 
     # Retrieve the cartesian candidates using the retrieve indices.
     cart_candidates = tree_candidates_ext[retrieve_indices]
@@ -541,12 +594,23 @@ def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_tok
     if logits_processor is not None:
         candidates_tree_prob = swift_logits[1]
         candidates_prob = torch.cat(
-            [torch.ones(1, device=candidates_tree_prob.device, dtype=torch.float32), candidates_tree_prob.view(-1)],
-            dim=-1)
+            [
+                torch.ones(1, device=candidates_tree_prob.device, dtype=torch.float32),
+                candidates_tree_prob.view(-1),
+            ],
+            dim=-1,
+        )
 
         tree_candidates_prob = candidates_prob[tree_indices]
         tree_candidates_prob_ext = torch.cat(
-            [tree_candidates_prob, torch.ones((1), dtype=torch.float32, device=tree_candidates_prob.device)], dim=0)
+            [
+                tree_candidates_prob,
+                torch.ones(
+                    (1), dtype=torch.float32, device=tree_candidates_prob.device
+                ),
+            ],
+            dim=0,
+        )
         cart_candidates_prob = tree_candidates_prob_ext[retrieve_indices]
     else:
         cart_candidates_prob = None
@@ -557,12 +621,12 @@ def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_tok
 
 
 def tree_decoding(
-        model,
-        tree_candidates,
-        past_key_values,
-        swift_position_ids,
-        input_ids,
-        retrieve_indices,
+    model,
+    tree_candidates,
+    past_key_values,
+    swift_position_ids,
+    input_ids,
+    retrieve_indices,
 ):
     """
     Decode the tree candidates using the provided model and reorganize the logits.
@@ -597,14 +661,14 @@ def tree_decoding(
 
 
 def evaluate_posterior(
-        logits: torch.Tensor,
-        candidates: torch.Tensor,
-        logits_processor,
-        cart_candidates_prob,
-        op,
-        p_indices,
-        tree_candidates,
-        b_indices
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    logits_processor,
+    cart_candidates_prob,
+    op,
+    p_indices,
+    tree_candidates,
+    b_indices,
 ):
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
@@ -630,7 +694,7 @@ def evaluate_posterior(
     if logits_processor is None:
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
-                candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
+            candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
@@ -686,7 +750,9 @@ def evaluate_posterior(
                         max_id = gtp.argmax()
                         gtp = gtp - q
                         gtp[gtp < 0] = 0
-                        if torch.equal(gtp.cpu(), torch.zeros(gtp.shape)): # multinomial error
+                        if torch.equal(
+                            gtp.cpu(), torch.zeros(gtp.shape)
+                        ):  # multinomial error
                             gtp[max_id] = 1
                         gtp = gtp / (gtp.sum() + 1e-6)
                         adjustflag = True
@@ -711,7 +777,7 @@ def get_next_point_to_probe(attn_skip_layers, mlp_skip_layers, num_hidden_layers
     """
     next_point_to_probe = {}
     for i in range(num_hidden_layers - 2):
-        if (i+1) in attn_skip_layers:
+        if (i + 1) in attn_skip_layers:
             next_point_to_probe[f"x{i}"] = 1.0
         else:
             next_point_to_probe[f"x{i}"] = 0.0
@@ -740,7 +806,9 @@ def layer_bayes_search(optimizer, utility, num_skip_layers=34, num_hidden_layers
     - list: List of indices of the skipped MLP layers.
     """
     next_point_to_probe = optimizer.suggest(utility)
-    sorted_point = sorted(next_point_to_probe.items(), reverse=True, key=lambda item: item[1])
+    sorted_point = sorted(
+        next_point_to_probe.items(), reverse=True, key=lambda item: item[1]
+    )
     skip_layer_list = [k for (k, v) in sorted_point[:num_skip_layers]]
     attn_skip_layers = []
     mlp_skip_layers = []
@@ -765,7 +833,9 @@ def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
     - list: List of indices of the skipped attention layers.
     - list: List of indices of the skipped MLP layers.
     """
-    skip_layer_list = np.random.choice((num_hidden_layers-2) * 2, num_skip_layers, replace=False)
+    skip_layer_list = np.random.choice(
+        (num_hidden_layers - 2) * 2, num_skip_layers, replace=False
+    )
     attn_skip_layers = []
     mlp_skip_layers = []
     for i in range(num_hidden_layers - 2):
@@ -777,8 +847,17 @@ def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
     return attn_skip_layers, mlp_skip_layers
 
 
-def swift_optimization(model, output_ids, input_past_key_values_data,
-            input_current_length_data, new_token_num, statistics, optimizer=None, utility=None, position_ids=None):
+def swift_optimization(
+    model,
+    output_ids,
+    input_past_key_values_data,
+    input_current_length_data,
+    new_token_num,
+    statistics,
+    optimizer=None,
+    utility=None,
+    position_ids=None,
+):
     """
     Perform an optimization to find the optimal layer set for the model based on the draft matchness.
 
@@ -800,72 +879,121 @@ def swift_optimization(model, output_ids, input_past_key_values_data,
     for i in range(len(input_past_key_values_data)):
         cur_past_key_values_data.append(input_past_key_values_data[i].clone())
     cur_current_length_data = input_current_length_data.clone()
-    input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
+    input_past_key_values = clone_past_key_values(
+        model, cur_past_key_values_data, cur_current_length_data
+    )
 
     # preserve original layer set
-    origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = model.get_skip_layers()
+    origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = (
+        model.get_skip_layers()
+    )
 
-    skip_layer_num = int((model.config.num_hidden_layers - 2) * 2 * statistics["skip_ratio"])
+    skip_layer_num = int(
+        (model.config.num_hidden_layers - 2) * 2 * statistics["skip_ratio"]
+    )
 
     # select new layer set
-    if (statistics["opt_iter"] + 1) % statistics["bayes_interval"] == 0 and statistics["bayes"]:
+    if (statistics["opt_iter"] + 1) % statistics["bayes_interval"] == 0 and statistics[
+        "bayes"
+    ]:
         logging.info("*" * 30 + "Bayes Search!" + "*" * 30)
-        next_point_to_probe, _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_bayes_search(
-            optimizer, utility, num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
+        next_point_to_probe, _attn_skip_layer_id_set, _mlp_skip_layer_id_set = (
+            layer_bayes_search(
+                optimizer,
+                utility,
+                num_skip_layers=skip_layer_num,
+                num_hidden_layers=model.config.num_hidden_layers,
+            )
+        )
     else:
         _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_random_search(
-            num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
-        next_point_to_probe = get_next_point_to_probe(_attn_skip_layer_id_set, _mlp_skip_layer_id_set, model.config.num_hidden_layers)
+            num_skip_layers=skip_layer_num,
+            num_hidden_layers=model.config.num_hidden_layers,
+        )
+        next_point_to_probe = get_next_point_to_probe(
+            _attn_skip_layer_id_set,
+            _mlp_skip_layer_id_set,
+            model.config.num_hidden_layers,
+        )
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
     # parallel drafting on previous decoded results
     with torch.inference_mode():
         with model.self_draft():
             step_end = statistics["context_window"] + 1
-            parallel_draft_output = model.model(input_ids=generate_ids[:, :step_end],
-                                                attention_mask=None,
-                                                past_key_values=input_past_key_values,
-                                                position_ids=position_ids)
+            parallel_draft_output = model.model(
+                input_ids=generate_ids[:, :step_end],
+                attention_mask=None,
+                past_key_values=input_past_key_values,
+                position_ids=position_ids,
+            )
     parallel_draft_logits = model.lm_head(parallel_draft_output[0])
     parallel_draft_output_ids = torch.argmax(parallel_draft_logits, dim=-1)
-    verified_token_num = (parallel_draft_output_ids[:, :-1] == generate_ids[:, 1:step_end].to(parallel_draft_output_ids.device)).sum(-1).item()
+    verified_token_num = (
+        (
+            parallel_draft_output_ids[:, :-1]
+            == generate_ids[:, 1:step_end].to(parallel_draft_output_ids.device)
+        )
+        .sum(-1)
+        .item()
+    )
     drafted_token_num = generate_ids[:, 1:step_end].size(-1)
     score = verified_token_num / drafted_token_num
-    logging.info('opt_iter {}, matchness {:.4f}'.format(statistics["opt_iter"], score))
+    logging.info("opt_iter {}, matchness {:.4f}".format(statistics["opt_iter"], score))
 
     # update the bayes optimizer
     optimizer.register(params=next_point_to_probe, target=score)
 
     if score > statistics["origin_score"]:
-        logging.info("=" * 30 + 'matchness changed from {:.4f} to {:.4f}'.format(statistics["origin_score"], score) + "=" * 30)
+        logging.info(
+            "=" * 30
+            + "matchness changed from {:.4f} to {:.4f}".format(
+                statistics["origin_score"], score
+            )
+            + "=" * 30
+        )
         statistics["origin_score"] = score
         statistics["tolerance_iter"] = 0
         if score > statistics["max_score"]:
             statistics["optimization"] = False  # stop optimization
-            logging.info("=" * 30 + 'Optimization Stopped because the score reaches the expected number!' + "=" * 30)
+            logging.info(
+                "=" * 30
+                + "Optimization Stopped because the score reaches the expected number!"
+                + "=" * 30
+            )
     else:
-        model.set_skip_layers(origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set)  # choose the better one
+        model.set_skip_layers(
+            origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set
+        )  # choose the better one
         statistics["tolerance_iter"] += 1
     statistics["opt_iter"] += 1
     if statistics["tolerance_iter"] > statistics["max_tolerance_iter"]:
         statistics["optimization"] = False  # stop optimization
-        logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the max tolerance!' + "=" * 30)
+        logging.info(
+            "=" * 30
+            + "Optimization Stopped because the optimization iter reaches the max tolerance!"
+            + "=" * 30
+        )
     if statistics["opt_iter"] > statistics["max_opt_iter"]:
         statistics["optimization"] = False  # stop optimization
-        logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the maximum!' + "=" * 30)
+        logging.info(
+            "=" * 30
+            + "Optimization Stopped because the optimization iter reaches the maximum!"
+            + "=" * 30
+        )
 
 
 def update_inference_inputs(
-        input_ids,
-        candidates,
-        best_candidate,
-        accept_length,
-        retrieve_indices,
-        logits_processor,
-        new_token_num,
-        past_key_values_data_list,
-        current_length_data,
-        sample_p,
+    input_ids,
+    candidates,
+    best_candidate,
+    accept_length,
+    retrieve_indices,
+    logits_processor,
+    new_token_num,
+    past_key_values_data_list,
+    current_length_data,
+    sample_p,
 ):
     """
     Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
@@ -891,18 +1019,26 @@ def update_inference_inputs(
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
-            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+        retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
-        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
+        [
+            input_ids,
+            candidates[None, best_candidate, : accept_length + 1].to(input_ids.device),
+        ],
+        dim=-1,
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
     for past_key_values_data in past_key_values_data_list:
-        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
+        tgt = past_key_values_data[
+            ..., select_indices.to(past_key_values_data.device), :
+        ]
         # Destination tensor where the relevant past information will be stored
-        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
+        dst = past_key_values_data[
+            ..., prev_input_len : prev_input_len + tgt.shape[-2], :
+        ]
         # Copy relevant past information from the source to the destination
         dst.copy_(tgt, non_blocking=True)
 

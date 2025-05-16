@@ -15,9 +15,9 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-from .kv_cache import clone_past_key_values
+from model.pld.pld import find_candidate_pred_tokens
 
-TOPK = 10  # topk
+from .kv_cache import clone_past_key_values
 
 
 def set_logger(log_path=None):
@@ -79,45 +79,6 @@ def prepare_logits_processor(
             processor_list.append(TopKLogitsWarper(top_k))
         return processor_list
 
-
-def clasp_verify(
-    model,
-    input_ids=None,
-    past_key_values=None,
-    position_ids=None,
-    use_cache=True,
-    output_hidden_states=True,
-    output_attentions=False,
-):
-    """
-    Verify the clasp structure using the provided model and input.
-
-    Args:
-    - input_ids (torch.Tensor): The input tensor containing token ids.
-    - model (LLM): The model containing the full LLM model.
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
-    - position_ids (torch.Tensor): Positional IDs associated with the clasp structure.
-
-    Returns:
-    - outputs (tuple): Contains the outputs from the model.
-    - orig (torch.Tensor): Original logits from the full model.
-    """
-    with torch.inference_mode():
-        # Pass input through the base model
-        outputs = model.model(
-            input_ids=input_ids,
-            attention_mask=None,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            output_attentions=output_attentions,
-        )
-        orig = model.lm_head(outputs[0])
-
-    return outputs, orig
-
-
 def sample(logits, logits_processor, all_logits=False, k=1):
     """
     Sample from the provided logits using the specified processor.
@@ -171,88 +132,157 @@ def sample(logits, logits_processor, all_logits=False, k=1):
 @torch.no_grad()
 def clasp_draft(
     model,
-    input_ids=None,
-    draft_skip_mask=None,  # The dynamically calculated skip mask S
+    device,
+    input_ids_list=None,
+    current_draft_skip_mask=None,
     new_token_num=0,
-    past_key_values_data=None,  # Use CLONED KV cache for drafting
+    past_key_values_data=None,
     current_length_data=None,
     max_new_tokens=1024,
     position_ids=None,
-    max_step_draft=25,
+    K=25,
+    DET=0.7,
+    eos_token_id=None,
     logits_processor=None,
-    stop_threshold=0.8,  # Corresponds to Draft-Exiting Threshold (DET)
+    HC = False,
+    VC = False,
+    tree = False,
 ):
-    """
-    Draft new tokens usißng the CLaSp dynamically determined skip mask.
-    Args:
-        model: The LLM model instance.
-        input_ids: Starting token(s) for drafting.
-        draft_skip_mask: Boolean tensor (size L) indicating which layers to skip for THIS draft.
-    Returns:
-        Tuple: (draft_tokens, draft_probs, draft_full_probs), top1_probs_list
-    """
-    # Clone KV cache specifically for this drafting phase if needed, or manage carefully.
-    draft_past_key_values = clone_past_key_values(
-        model, past_key_values_data, current_length_data
+    draft_tokens = []
+    # Use a *cloned* KV cache structure for drafting
+    # We need to clone the underlying data tensors and create new KVCache objects
+    draft_past_key_values_data_list = [d.clone() for d in past_key_values_data]
+    draft_current_length_data = (
+        current_length_data.clone()
+    )  # This tracks lengths for the draft cache
+    # Create new KVCache objects pointing to the *cloned* data
+    draft_kv_cache_list = clone_past_key_values(
+        model, draft_past_key_values_data_list, draft_current_length_data
     )
-    draft_tokens, draft_probs, draft_full_probs, top1_probs_list = [], [], [], []
-    current_input_ids = input_ids
-    for step_draft in range(max_step_draft):
-        # Apply the DYNAMIC skip mask for this draft using a context manager
-        # This requires modifying the model's LlamaDecoderLayer or the context manager
-        # to accept and use 'draft_skip_mask' temporarily.
-        with model.self_draft(dynamic_skip_mask=draft_skip_mask):
-            draft_outputs = model.model(
-                input_ids=current_input_ids,
-                past_key_values=draft_past_key_values,
-                position_ids=position_ids,
-                output_hidden_states=False,  # Don't need hidden states during draft
-                use_cache=True,  # Essential for autoregressive drafting
+
+    first_draft_input_ids = torch.tensor(
+        [input_ids_list[0][-1]], device=device
+    ).unsqueeze(0)
+    next_draft_input_ids = first_draft_input_ids
+    continue_hc = True
+    for draft_step_idx in range(K):
+        # logging.info(f"token count: {len(draft_tokens) + generated_token_count}")
+        # draft_i_start = time.time()
+        # Pass the draft KVCache list to the model during drafting
+        with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
+            draft_outputs = model(  # Call the main model forward
+                input_ids=next_draft_input_ids,
+                past_key_values=draft_kv_cache_list,  # Use draft cache list
+                # past_key_values=past_key_values,
+                output_hidden_states=False,
             )
-        # draft_outputs includes logits and updated past_key_values for the draft model
-        current_draft_logits = model.lm_head(draft_outputs[0])
-        draft_past_key_values = (
-            draft_outputs.past_key_values
-        )  # Use the updated KV cache
-        # --- Sampling (same as swift_draft) ---
-        if logits_processor is not None:
-            topk_index, topk_prob, full_prob = sample(
-                current_draft_logits[:, -1, :], logits_processor, k=TOPK
-            )
-            next_token = topk_index[:, 0].unsqueeze(-1)  # Shape (batch=1, 1)
+        # draft_i_end_time = time.time()
+        # logging.info(
+        #     f"Drafting foward step {draft_step_idx + 1} time: {draft_i_end_time - draft_i_start:.4f}s"
+        # )
+        draft_logits = draft_outputs.logits[:, -1, :]  # Logits for next token
+        # draft_kv_cache_list is automatically updated by the forward pass
+        # (DET check and sampling logic unchanged)
+        if logits_processor:
+            draft_logits_processed = logits_processor(
+                torch.tensor(input_ids_list, device=device), draft_logits
+            )  # Pass full history?
         else:
-            top = torch.topk(current_draft_logits[:, -1, :], TOPK, dim=-1)
-            topk_index, topk_prob = top.indices, top.values
-            next_token = topk_index[:, 0].unsqueeze(-1)  # Shape (batch=1, 1)
-            full_prob = None  # No full prob distribution in greedy
-        draft_tokens.append(topk_index)
-        draft_probs.append(topk_prob)
-        draft_full_probs.append(full_prob)
-        # --- Draft Exiting Threshold (DET) Check ---
-        origin_draft_probs = torch.softmax(current_draft_logits[:, -1, :], dim=-1)
-        argmax_prob = torch.gather(origin_draft_probs, -1, next_token).squeeze(-1)
-        current_threshold = argmax_prob.item()
-        top1_probs_list.append(current_threshold)
-        # Update input for next draft step
-        current_input_ids = next_token
-        if position_ids is not None:
-            position_ids = position_ids[..., -1:] + 1  # Increment position id
-        if (
-            current_threshold < stop_threshold
-            or new_token_num + step_draft + 2 >= max_new_tokens
-        ):
+            draft_logits_processed = draft_logits
+        draft_probs = torch.softmax(draft_logits_processed, dim=-1)
+        top1_prob = torch.max(draft_probs, dim=-1).values.item()
+        if logits_processor:
+            next_token = torch.multinomial(draft_probs, num_samples=1)
+        else:
+            next_token = torch.argmax(draft_logits_processed, dim=-1, keepdim=True)
+        draft_tokens.append(next_token.item())
+        next_draft_input_ids = next_token
+        if top1_prob < DET and len(draft_tokens) > 0:
             break
-    # Ensure outputs are tensors even if loop finishes early or runs 0 times
-    if not draft_tokens:
-        # Return empty tensors of appropriate type/device if no tokens were drafted
-        empty_long = torch.tensor([], dtype=torch.long, device=input_ids.device)
-        empty_float = torch.tensor([], dtype=model.dtype, device=input_ids.device)
-        return (empty_long, empty_float, []), []
-    return (
-        torch.cat(draft_tokens, dim=0),
-        torch.cat(draft_probs, dim=0),
-        draft_full_probs,
-    ), top1_probs_list
+
+        if next_token.item() == eos_token_id:
+            continue_hc = False
+            break
+
+        if len(draft_tokens) + new_token_num >= max_new_tokens - 2:
+            continue_hc = False
+            break
+    # PLD HC
+    if HC and continue_hc:
+        draft_ids = torch.tensor(
+            [input_ids_list[0] + draft_tokens], device=device
+        )
+        max_new_draft = max_new_tokens - len(draft_tokens) - new_token_num -2
+        pld_candidate_tokens = find_candidate_pred_tokens(
+            draft_ids,
+            max_ngram_size=5,
+            num_pred_tokens=min(10, max_new_draft),
+        )
+        draft_tokens += pld_candidate_tokens.tolist()
+        
+
+    # # Clone KV cache specifically for this drafting phase if needed, or manage carefully.
+    # draft_past_key_values = clone_past_key_values(
+    #     model, past_key_values_data, current_length_data
+    # )
+    # draft_tokens, draft_probs, draft_full_probs, top1_probs_list = [], [], [], []
+    # current_input_ids = input_ids
+    # for step_draft in range(max_step_draft):
+    #     # Apply the DYNAMIC skip mask for this draft using a context manager
+    #     # This requires modifying the model's LlamaDecoderLayer or the context manager
+    #     # to accept and use 'draft_skip_mask' temporarily.
+    #     with model.self_draft(dynamic_skip_mask=draft_skip_mask):
+    #         draft_outputs = model.model(
+    #             input_ids=current_input_ids,
+    #             past_key_values=draft_past_key_values,
+    #             position_ids=position_ids,
+    #             output_hidden_states=False,  # Don't need hidden states during draft
+    #             use_cache=True,  # Essential for autoregressive drafting
+    #         )
+    #     # draft_outputs includes logits and updated past_key_values for the draft model
+    #     current_draft_logits = model.lm_head(draft_outputs[0])
+    #     draft_past_key_values = (
+    #         draft_outputs.past_key_values
+    #     )  # Use the updated KV cache
+    #     # --- Sampling (same as swift_draft) ---
+    #     if logits_processor is not None:
+    #         topk_index, topk_prob, full_prob = sample(
+    #             current_draft_logits[:, -1, :], logits_processor, k=TOPK
+    #         )
+    #         next_token = topk_index[:, 0].unsqueeze(-1)  # Shape (batch=1, 1)
+    #     else:
+    #         top = torch.topk(current_draft_logits[:, -1, :], TOPK, dim=-1)
+    #         topk_index, topk_prob = top.indices, top.values
+    #         next_token = topk_index[:, 0].unsqueeze(-1)  # Shape (batch=1, 1)
+    #         full_prob = None  # No full prob distribution in greedy
+    #     draft_tokens.append(topk_index)
+    #     draft_probs.append(topk_prob)
+    #     draft_full_probs.append(full_prob)
+    #     # --- Draft Exiting Threshold (DET) Check ---
+    #     origin_draft_probs = torch.softmax(current_draft_logits[:, -1, :], dim=-1)
+    #     argmax_prob = torch.gather(origin_draft_probs, -1, next_token).squeeze(-1)
+    #     current_threshold = argmax_prob.item()
+    #     top1_probs_list.append(current_threshold)
+    #     # Update input for next draft step
+    #     current_input_ids = next_token
+    #     if position_ids is not None:
+    #         position_ids = position_ids[..., -1:] + 1  # Increment position id
+    #     if (
+    #         current_threshold < stop_threshold
+    #         or new_token_num + step_draft + 2 >= max_new_tokens
+    #     ):
+    #         break
+    # # Ensure outputs are tensors even if loop finishes early or runs 0 times
+    # if not draft_tokens:
+    #     # Return empty tensors of appropriate type/device if no tokens were drafted
+    #     empty_long = torch.tensor([], dtype=torch.long, device=input_ids.device)
+    #     empty_float = torch.tensor([], dtype=model.dtype, device=input_ids.device)
+    #     return (empty_long, empty_float, []), []
+    # return (
+    #     torch.cat(draft_tokens, dim=0),
+    #     torch.cat(draft_probs, dim=0),
+    #     draft_full_probs,
+    # ), top1_probs_list
 
 
 def reset_past_key_values(past_key_values):
@@ -533,296 +563,5 @@ def CLaSp_Skip_Layer_Strategy_SeqParallel(
         )
         # Optional: Implement a correction mechanism if this happens, e.g., un-skip layers
         # with lowest impact based on some heuristic, though this indicates a DP logic issue.
-
-    return S
-
-
-# !!! IMPORTANT: This is a basic implementation. The 'Sequence Parallel' optimization
-# from the CLaSp paper (Sec 3.6) is NOT implemented here and is critical for speed.
-# Running layers sequentially in the DP loop is very slow.
-# @torch.no_grad()
-# def CLaSp_Skip_Layer_Strategy(L, M, hidden_states_H, model_layers, device):
-#     """
-#     Implements the CLaSp DP algorithm (Algorithm 1) to find the optimal skipped layer set.
-#     Args:
-#         L: Total number of decoder layers in the verify model.
-#         M: Target number of layers to skip.
-#         hidden_states_H: List/Tuple of hidden states {h_0, h_1, ..., h_L} from verify pass
-#                          for the *last accepted token*. h_0 is embedding output.
-#                          Each h_i should be a tensor of shape (hidden_dim,).
-#         model_layers: The list/nn.ModuleList of the verify model's layers.
-#         device: The torch device to use.
-#     Returns:
-#         S: A boolean torch tensor of size L, where S[i] = True if layer i should be skipped.
-#     """
-#     d = hidden_states_H[0].shape[-1] # Hidden dimension
-#     # DP table using a dictionary: g[(i, j)] stores the best approximate hidden state
-#     # after processing the first i layers, having skipped exactly j layers.
-#     g = {}
-#     # Store parent pointers for easier backtracking: parent[(i, j)] = (prev_i, prev_j, was_skipped)
-#     parent = {}
-#     # Initialize base case: embedding output
-#     g[(0, 0)] = hidden_states_H[0].to(device) # g[0,0] <- x_0
-#     # --- Dynamic Programming ---
-#     for i in range(1, L + 1): # Iterate through layers 1 to L (representing layers 0 to L-1)
-#         h_i = hidden_states_H[i].to(device) # Target state x_i (output of layer i-1)
-#         layer_func = model_layers[i - 1] # Function for f_{i-1}
-#         # Max number of skips possible *before* this layer
-#         max_prev_skips = min(i - 1, M)
-#         # Iterate through possible number of skips 'j' *at step i*
-#         for j in range(min(i, M) + 1):
-#             # Option 1: Arrive at state (i, j) by NOT skipping layer i-1.
-#             # Came from state (i-1, j). Requires j <= max_prev_skips.
-#             state_if_not_skipped = None
-#             sim_if_not_skipped = -float('inf')
-#             if j <= max_prev_skips and (i - 1, j) in g:
-#                 prev_state = g[(i - 1, j)]
-#                 # Apply layer i-1. Ensure layer runs in inference mode and handles device.
-#                 # The layer needs the hidden state as input. Assumes standard Transformer Layer API.
-#                 # NOTE: This layer execution is the bottleneck without Sequence Parallel optimization.
-#                 # We pass attention_mask=None, past_key_value=None as we process a single state.
-#                 current_state = layer_func(prev_state.unsqueeze(0).unsqueeze(0), output_attentions=False)[0] # Add batch/seq dims
-#                 state_if_not_skipped = current_state.squeeze(0).squeeze(0) # Remove batch/seq dims
-#                 sim_if_not_skipped = cosine_similarity(normalize_tensor(state_if_not_skipped), normalize_tensor(h_i))
-#             # Option 2: Arrive at state (i, j) by SKIPPING layer i-1.
-#             # Came from state (i-1, j-1). Requires j > 0.
-#             state_if_skipped = None
-#             sim_if_skipped = -float('inf')
-#             if j > 0 and (i - 1, j - 1) in g:
-#                 state_if_skipped = g[(i - 1, j - 1)]
-#                 sim_if_skipped = cosine_similarity(normalize_tensor(state_if_skipped), normalize_tensor(h_i))
-#             # Decide based on cosine similarity (higher is better)
-#             if sim_if_not_skipped >= sim_if_skipped:
-#                 if state_if_not_skipped is not None: # Check if this path was possible
-#                     g[(i, j)] = state_if_not_skipped
-#                     parent[(i, j)] = (i - 1, j, False) # Came from (i-1, j), layer i-1 was NOT skipped
-#             else:
-#                 if state_if_skipped is not None: # Check if this path was possible
-#                     g[(i, j)] = state_if_skipped
-#                     parent[(i, j)] = (i - 1, j - 1, True) # Came from (i-1, j-1), layer i-1 was SKIPPED
-#     # --- Backtracking ---
-#     S = torch.zeros(L, dtype=torch.bool, device=device)
-#     current_i, current_j = L, M
-#     # Find the best available state at layer L if (L, M) wasn't reached
-#     if (L, M) not in g:
-#         best_final_j = -1
-#         max_final_sim = -float('inf')
-#         h_L = hidden_states_H[L].to(device)
-#         for j_final in range(M + 1):
-#             if (L, j_final) in g:
-#                 sim = cosine_similarity(normalize_tensor(g[(L, j_final)]), normalize_tensor(h_L))
-#                 if sim > max_final_sim:
-#                     max_final_sim = sim
-#                     best_final_j = j_final
-#         if best_final_j != -1:
-#             current_j = best_final_j
-#             logging.warning(f"CLaSp DP: Target skips M={M} not reached. Using best j={current_j} at final layer.")
-#         else:
-#             logging.error("CLaSp DP: No valid path found in DP table during backtracking.")
-#             return S # Return all zeros
-#     # Trace back the path
-#     while current_i > 0:
-#         if (current_i, current_j) not in parent:
-#              # Should not happen if a valid final state was found
-#              logging.error(f"CLaSp DP: Backtracking error - state ({current_i}, {current_j}) has no parent.")
-#              break
-#         prev_i, prev_j, was_skipped = parent[(current_i, current_j)]
-#         if was_skipped:
-#             S[current_i - 1] = True # Layer i-1 was skipped
-#         current_i, current_j = prev_i, prev_j
-#     if torch.sum(S) > M:
-#          logging.warning(f"CLaSp DP Backtracking resulted in {torch.sum(S)} skips, expected {M}. Might indicate DP issues.")
-#     return S
-
-
-@torch.no_grad()
-def clasp_skip_layer_strategy(
-    num_hidden_layers_L: int,
-    max_skip_layers_M: int,
-    target_hidden_states_X: torch.Tensor,
-    decoder_layers,
-    hidden_size_d: int,
-) -> torch.Tensor:
-    """
-    Implements the CLaSp Skip Layer Strategy (Algorithm 1).
-
-    Args:
-        num_hidden_layers_L (int): Total number of hidden layers in the original model.
-        max_skip_layers_M (int): Maximum number of layers CLaSp is allowed to skip.
-        target_hidden_states_X (torch.Tensor): Tensor of shape (L+1, d) containing
-            the hidden states from the full model.
-            target_hidden_states_X[0] is the initial embedding.
-            target_hidden_states_X[k] for k > 0 is the hidden state *after*
-            the (k-1)-th original decoder layer.
-        decoder_layers (nn.ModuleList): A list of the L original decoder layers.
-            decoder_layers[k] is the k-th layer (0-indexed).
-        hidden_size_d (int): The dimensionality of the hidden states.
-
-    Returns:
-        torch.Tensor: A boolean tensor S of shape (L), where S[k] is True if
-                      layer k should be skipped, and False otherwise.
-    """
-    device = target_hidden_states_X[0].device
-    dtype = target_hidden_states_X[0].dtype
-
-    # DP table g[i][j]: stores the "optimal" hidden state vector (d-dim)
-    # after considering the first i original layers (0 to i-1),
-    # having skipped exactly j of them.
-    # "Optimal" means its cosine similarity to target_hidden_states_X[i] is maximized.
-    # Dimensions: (L+1) rows for layers (0 to L), (M+1) cols for skips (0 to M)
-    g = torch.full(
-        (num_hidden_layers_L + 1, max_skip_layers_M + 1, hidden_size_d),
-        float("-inf"),
-        device=device,
-        dtype=dtype,
-    )
-
-    # choices[i][j]: stores whether layer (i-1) was skipped (0) or processed (1)
-    # to achieve the state g[i][j].
-    choices = torch.full(
-        (num_hidden_layers_L + 1, max_skip_layers_M + 1),
-        -1,
-        device=device,
-        dtype=torch.int8,
-    )  # -1: invalid
-
-    # Base case: g[0][0] is the initial embedding (before any layers)
-    # target_hidden_states_X[0] is the initial embedding.
-    g[0][0] = target_hidden_states_X[0]
-
-    # Fill the DP table
-    # i represents the state *after* considering original layer (i-1),
-    # targeting target_hidden_states_X[i].
-    for i in range(1, num_hidden_layers_L + 1):
-        # Case 1: No layers skipped up to layer (i-1) (j=0 skips)
-        # The state g[i][0] is simply the target state if no skips were allowed.
-        # Or, more accurately, it's target_hidden_states_X[i] itself,
-        # as per the paper's g[i,0] = X_i.
-        g[i][0] = target_hidden_states_X[i]
-        choices[i][0] = (
-            1  # Indicates layer (i-1) was "processed" to get here from g[i-1][0] via full model path
-        )
-
-        # Iterate over the number of skips j (from 1 to M)
-        for j in range(1, max_skip_layers_M + 1):
-            if j > i:  # Cannot skip more layers than available so far
-                continue
-
-            # Option A: Current original layer (i-1) is SKIPPED
-            # This means we must have had j-1 skips from the first i-1 layers (0 to i-2).
-            # The previous state was g[i-1][j-1].
-            sim_if_skipped = -float("inf")
-            state_if_skipped = g[i - 1][
-                j - 1
-            ]  # This is the state if layer (i-1) is skipped
-
-            if not torch.isinf(
-                state_if_skipped
-            ).any():  # Check if previous state was valid
-                # Cosine similarity with the target state for layer i
-                # (i.e., output of full model's layer i-1)
-                sim_if_skipped = F.cosine_similarity(
-                    state_if_skipped.unsqueeze(0),
-                    target_hidden_states_X[i].unsqueeze(0),
-                ).item()
-            else:  # previous state was invalid
-                state_if_skipped = torch.full_like(
-                    g[0, 0, 0], float("-inf")
-                )  # ensure it's marked invalid
-
-            # Option B: Current original layer (i-1) is PROCESSED
-            # This means we must have had j skips from the first i-1 layers (0 to i-2).
-            # The previous state was g[i-1][j].
-            sim_if_processed = -float("inf")
-            state_if_processed = torch.full_like(
-                g[0, 0, 0], float("-inf")
-            )  # Placeholder
-
-            # We need 'j' skips out of 'i-1' layers processed so far if current layer (i-1) is *not* skipped.
-            # This means j must be <= number of layers considered before current one, which is (i-1).
-            if j <= (i - 1) and not torch.isinf(g[i - 1][j]).any():
-                prev_state_for_processing = g[i - 1][j]
-                # Pass through the (i-1)-th decoder layer
-                # Model layers expect (batch, seq_len, dim)
-                # Here, batch=1, seq_len=1
-                current_layer = decoder_layers[i - 1]  # Layer (i-1) is at index i-1
-                processed_output_tensor = current_layer(
-                    prev_state_for_processing.unsqueeze(0).unsqueeze(0)
-                )
-                state_if_processed_temp = processed_output_tensor.squeeze(0).squeeze(0)
-
-                sim_if_processed = F.cosine_similarity(
-                    state_if_processed_temp.unsqueeze(0),
-                    target_hidden_states_X[i].unsqueeze(0),
-                ).item()
-                state_if_processed = state_if_processed_temp  # Update actual state
-            # else: previous state was invalid or j > i-1, so this path is not possible
-
-            # Decide which option is better (higher cosine similarity)
-            if (
-                sim_if_skipped >= sim_if_processed
-            ):  # Favors skipping if equal or skip is better
-                if sim_if_skipped > -float("inf"):  # ensure at least one path was valid
-                    g[i][j] = state_if_skipped
-                    choices[i][j] = 0  # 0 means layer (i-1) was skipped
-                # If both are -inf, g[i][j] remains -inf, choices[i][j] remains -1
-            elif sim_if_processed > -float(
-                "inf"
-            ):  # implies sim_if_processed > sim_if_skipped and valid
-                g[i][j] = state_if_processed
-                choices[i][j] = 1  # 1 means layer (i-1) was processed
-            # If both sims are -inf, g[i][j] remains -inf, and choices[i][j] remains -1.
-
-    # Backtracking to find the optimal skipped layer set S
-    S = torch.zeros(num_hidden_layers_L, dtype=torch.bool, device=device)
-
-    # Find the optimal number of skips at the last layer L.
-    # We want g[L][j_final] that is most similar to target_hidden_states_X[L].
-    # If multiple j give same max similarity, paper seems to imply using M,
-    # but choosing the one that actually yields max sim is better.
-    final_similarities = torch.zeros(max_skip_layers_M + 1, device=device, dtype=dtype)
-    for j_idx in range(max_skip_layers_M + 1):
-        if not torch.isinf(g[num_hidden_layers_L][j_idx]).any():
-            final_similarities[j_idx] = F.cosine_similarity(
-                g[num_hidden_layers_L][j_idx].unsqueeze(0),
-                target_hidden_states_X[num_hidden_layers_L].unsqueeze(0),
-            ).item()
-        else:
-            final_similarities[j_idx] = -float("inf")
-
-    if torch.all(final_similarities == -float("inf")):
-        # This should ideally not happen if g[L][0] (X_target[L]) is always valid.
-        # It means no valid path was found to reach the end with any number of skips.
-        # Fallback: skip no layers, or a predefined pattern if any.
-        # For now, let's assume it won't happen or return S as all False.
-        print("Warning: No valid DP path found to the final layer. Returning no skips.")
-        return S  # All False (no skips)
-
-    current_j = torch.argmax(final_similarities).item()
-
-    # Trace back from layer L-1 down to 0
-    for i in range(num_hidden_layers_L, 0, -1):  # From L down to 1
-        # Decision for layer (i-1)
-        choice_for_layer_i_minus_1 = choices[i][current_j]
-
-        if choice_for_layer_i_minus_1 == 0:  # Layer (i-1) was skipped
-            S[i - 1] = True
-            current_j -= 1
-        elif choice_for_layer_i_minus_1 == 1:  # Layer (i-1) was processed
-            S[i - 1] = False
-            # current_j remains the same
-        else:  # Should not happen if backtracking from a valid final state
-            print(
-                f"Warning: Invalid choice encountered during backtracking at i={i}, j={current_j}. Assuming not skipped."
-            )
-            S[i - 1] = False
-            # Attempt to recover: if current_j was from skipping, decrement.
-            # This part is tricky if an invalid state is hit. The DP table should be robust.
-
-        if current_j < 0:  # Should not happen if choices are consistent
-            # This might occur if we backtrack from an M that wasn't actually achievable
-            # Or if choices table has an issue.
-            # print(f"Warning: current_j became negative ({current_j}) at i={i-1}. Breaking.")
-            break
 
     return S

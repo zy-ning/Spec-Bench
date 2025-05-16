@@ -28,6 +28,7 @@ from model.myswift.utils import (
     generate_swift_buffers,
     get_cache_configuration,
     get_choices_list,
+    get_choices_list_notree,
     initialize_swift,
     prepare_logits_processor,
     reset_swift_mode,
@@ -39,7 +40,7 @@ from model.myswift.utils import (
 )
 from model.pld.pld import greedy_search_pld
 
-
+first_acc_rates = []
 def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
     input_ids = inputs.input_ids.cuda()
@@ -82,6 +83,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         # "dp_optim": [],
         # "draft_clone_kv": [],
         "draft_loop": [],
+        "avg_draft_time": [],
         "verify": [],
         "accept_update": [],
         "misc_overhead": [],
@@ -95,7 +97,8 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         # drafted tokens + 1 bonus verified token
         draft_token_num += len(top1_prob)
         # Initialize the swift buffer
-        swift_choices = eval(f"{get_choices_list(top1_prob, logits_processor=logits_processor)}")
+        swift_choices = eval(f"{get_choices_list_notree(top1_prob, logits_processor=logits_processor)}")
+        # logging.info(f"Swift choices: {swift_choices}")
         swift_buffers = generate_swift_buffers(swift_choices, device=model.model.layers[-1].self_attn.q_proj.weight.device)
         model.swift_buffers = swift_buffers
         model.swift_choices = swift_choices
@@ -127,6 +130,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 swift_buffers["p_indices"], tree_candidates, swift_buffers["b_indices"]
             )
 
+        if accept_length == 0:
+            first_acc_rates.append(0)
+        else:
+            first_acc_rates.append(1)
+
         input_ids, new_token_num, sample_token = update_inference_inputs(
             input_ids,
             candidates,
@@ -155,7 +163,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 statistics,
                 optimizer=optimizer,
                 utility=utility)
-        
+
 
 
         # swift drafting
@@ -170,8 +178,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         )
         
         draft_loop_end_time = time.time()
-        timings["draft_loop"].append(draft_loop_end_time - accept_update_end_time)
-
+        draft_time = draft_loop_end_time - accept_update_end_time
+        timings["draft_loop"].append(draft_time)
+        timings["avg_draft_time"].append(
+            draft_time / len(top1_prob)
+        )
         
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
@@ -197,6 +208,10 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
              logging.info(f"{key}: {avg_time:.4f}s")
         else:
              logging.info(f"{key}: N/A (not run or no steps)")
+    logging.info(f"Average Acceptance Length: {np.mean(accept_length_list) - 1:.4f}")
+    logging.info(
+        f"Finished. Total steps: {idx}, Total generated: {new_token_num}"
+    )
 
     return input_ids, new_token_num, idx + 1, accept_length_list #, draft_token_num
 
@@ -425,5 +440,7 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
+    
+    print("First acceptance rate: ", np.mean(first_acc_rates))
     
     reorg_answer_file(answer_file)

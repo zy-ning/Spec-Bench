@@ -22,6 +22,8 @@ def speed(jsonl_file, jsonl_file_base, tokenizer, task=None, report=True):
     with open(jsonl_file, "r", encoding="utf-8") as file:
         for line in file:
             json_obj = json.loads(line)
+            if json_obj["question_id"] == 81:
+                data = []
             if task == "overall":
                 data.append(json_obj)
             elif task == "mt_bench":
