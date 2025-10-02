@@ -289,6 +289,8 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     }
     swift_buffers["p_indices"] = swift_p_indices_new
     swift_buffers["b_indices"] = swift_b_indices_new
+
+    logging.info(f"Swift structure buffers: {swift_buffers.keys()}")
     return swift_buffers
 
 
@@ -628,6 +630,7 @@ def evaluate_posterior(
     """
     # Greedy decoding based on temperature value
     if logits_processor is None:
+        logging.info("evaling Candidates: " + str(candidates))
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)

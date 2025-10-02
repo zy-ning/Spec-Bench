@@ -20,9 +20,9 @@ from transformers import (
 )
 
 from evaluation.eval import reorg_answer_file, run_eval
-from model.swift.kv_cache import initialize_past_key_values
-from model.swift.modeling_llama import LlamaForCausalLM
-from model.swift.utils import (
+from model.casspec.kv_cache import initialize_past_key_values
+from model.casspec.modeling_llama import LlamaForCausalLM
+from model.casspec.utils import (
     evaluate_posterior,
     generate_candidates,
     generate_swift_buffers,
