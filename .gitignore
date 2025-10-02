@@ -215,3 +215,5 @@ log/
 data/spec_bench/model_answer/
 model/rest/datastore/datastore_chat_large.idx
 model/casspec/teal/vicuna*
+
+.DS_Store

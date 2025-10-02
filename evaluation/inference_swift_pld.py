@@ -20,15 +20,14 @@ from transformers import (
 )
 
 from evaluation.eval import reorg_answer_file, run_eval
-from model.myswift.kv_cache import initialize_past_key_values
-from model.myswift.modeling_llama import LlamaForCausalLM
-from model.myswift.utils import (
+from model.swift.kv_cache import initialize_past_key_values
+from model.swift.modeling_llama import LlamaForCausalLM
+from model.swift.utils import (
     evaluate_posterior,
     generate_candidates,
     generate_swift_buffers,
     get_cache_configuration,
     get_choices_list,
-    get_choices_list_notree,
     initialize_swift,
     prepare_logits_processor,
     reset_swift_mode,
@@ -38,9 +37,9 @@ from model.myswift.utils import (
     tree_decoding,
     update_inference_inputs,
 )
-from model.pld.pld import greedy_search_pld
 
 first_acc_rates = []
+
 def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
     input_ids = inputs.input_ids.cuda()
@@ -77,7 +76,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     new_token_num = 0
     draft_token_num = 0
     total_acc_num = 0
-    
+
     timings = {
         "total_step": [],
         # "dp_optim": [],
@@ -93,12 +92,11 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     for idx in range(max_steps):
         start_step = time.time()
         timings["misc_overhead"].append(start_step - step_end_time)
-        
+
         # drafted tokens + 1 bonus verified token
         draft_token_num += len(top1_prob)
         # Initialize the swift buffer
-        swift_choices = eval(f"{get_choices_list_notree(top1_prob, logits_processor=logits_processor)}")
-        # logging.info(f"Swift choices: {swift_choices}")
+        swift_choices = eval(f"{get_choices_list(top1_prob, logits_processor=logits_processor)}")
         swift_buffers = generate_swift_buffers(swift_choices, device=model.model.layers[-1].self_attn.q_proj.weight.device)
         model.swift_buffers = swift_buffers
         model.swift_choices = swift_choices
@@ -120,7 +118,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             input_ids,
             swift_buffers["retrieve_indices"],
         )
-        
+
         verify_end_time = time.time()
         timings["verify"].append(verify_end_time - start_step)
 
@@ -154,6 +152,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
                 and idx % statistics["opt_interval"] == 0):
+            logging.info("Swift optimization" + "-" * 10)
             swift_optimization(
                 model,
                 input_ids[:, input_len:],
@@ -176,14 +175,15 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
         )
-        
+
         draft_loop_end_time = time.time()
         draft_time = draft_loop_end_time - accept_update_end_time
         timings["draft_loop"].append(draft_time)
         timings["avg_draft_time"].append(
             draft_time / len(top1_prob)
         )
-        
+
+
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
@@ -192,14 +192,15 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             break
         if new_token_num > max_new_tokens:
             break
-        
+
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
-        
-        
+
+    totoal_acc_rate = total_acc_num / draft_token_num
     # logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
-    print("Total acceptance rate: {}".format(total_acc_num / draft_token_num))
-    
+    logging.info("Total acceptance rate: {}".format(totoal_acc_rate))
+
+    logging.info("total_steps: {}".format(idx))
     # --- Print Timings ---
     logging.info("--- Performance Timings (Average per Step) ---")
     for key, values in timings.items():
@@ -355,16 +356,10 @@ if __name__ == "__main__":
         type=int,
         help="A debug option. The end index of questions."
     )
-    parser.add_argument(
-        "--no-tree",
-        action="store_true",
-        default=False,
-        help="Whether to use tree decoding.",
-    )
 
     args = parser.parse_args()
 
-    args.model_name = (args.model_id + "-myswift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
+    args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                        + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio))
@@ -374,7 +369,7 @@ if __name__ == "__main__":
     print(f"Output to {answer_file}")
 
     question_file = f"data/{args.bench_name}/question.jsonl"
-    
+
     if args.answer_file:
         answer_file = args.answer_file
 
@@ -404,8 +399,7 @@ if __name__ == "__main__":
         _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
-    
-    model.greedy_search_pld = greedy_search_pld.__get__(model, type(model))
+
 
     seed_everything(args.seed)
     # Bayes Optimization Settings
@@ -440,7 +434,7 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
-    
+
     print("First acceptance rate: ", np.mean(first_acc_rates))
-    
+
     reorg_answer_file(answer_file)
