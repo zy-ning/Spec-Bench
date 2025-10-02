@@ -3,11 +3,12 @@ SIZE=7
 
 MODEL_NAME=lmsys_vicuna-${SIZE}b-v1.3
 Vicuna_PATH=/inspire/hdd/project/heziweiproject/heziwei-25044/public/download_ckpts/$MODEL_NAME
+GPU_DEVICES=0
 
 TEMP=0.0
 
 if [ -z "$GPU_DEVICES" ]; then
-    GPU_DEVICES=4
+    GPU_DEVICES=0
 fi
 
 SEED=2024

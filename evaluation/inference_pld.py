@@ -118,7 +118,8 @@ if __name__ == "__main__":
     if args.answer_file:
         answer_file = args.answer_file
     else:
-        suffix = "_csd" if args.use_csd_mgram else ""
+        # suffix = "_csd" if args.use_csd_mgram else ""
+        suffix = ""
         suffix += f"_{args.fallback}" if args.fallback != "none" else ""
         answer_file = f"data/{args.bench_name}/model_answer/{args.model_id}{suffix}.jsonl"
 
