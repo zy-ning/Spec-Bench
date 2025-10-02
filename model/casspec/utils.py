@@ -1,15 +1,11 @@
-# import copy
 import copy
+import json
 import logging
+import os.path
 import random
 
 import numpy as np
-
-# import numpy as np
 import torch
-
-# import torch.nn as nn
-# import torch.nn.functional as F
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -18,13 +14,9 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-# from transformers.generation.utils import _crop_past_key_values
-from model.pld.pld import find_candidate_pred_tokens
-
 from .kv_cache import clone_past_key_values
 
-TOPK = 10
-
+TOPK = 10  # topk for sparse tree
 
 def set_logger(log_path=None):
     """Set the logger to log info in terminal and file `log_path`.
@@ -44,22 +36,64 @@ def set_logger(log_path=None):
         # Logging to a file
         if log_path:
             file_handler = logging.FileHandler(log_path)
-            file_handler.setFormatter(
-                logging.Formatter("%(asctime)s:%(levelname)s: %(message)s")
-            )
+            file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s: %(message)s'))
             logger.addHandler(file_handler)
 
         # Logging to console
         stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(logging.Formatter("%(message)s"))
+        stream_handler.setFormatter(logging.Formatter('%(message)s'))
         logger.addHandler(stream_handler)
 
 
+def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13b', task_name='cnndm'):
+    """
+    Get the cached SWIFT configuration for LLM acceleration.
+    """
+    if not os.path.exists(file_name):
+        print("Cache file not found.")
+        return None
+    with open(file_name) as f:
+        data = json.load(f)
+        if f'{model_name}_{task_name}' not in data.keys():
+            print("Configuration not found in cache.")
+            return None
+        else:
+            print(f"Use cached configuration in {file_name}.")
+            return data[f'{model_name}_{task_name}']['attention'], data[f'{model_name}_{task_name}']['mlp']
+
+def get_choices_list(prob_list, logits_processor=None):
+    """
+    Generate tree choices list based on the provided confidence.
+
+    Parameters:
+    - prob_list (list): List of probabilities.
+    - logits_processor (LogitsProcessorList): Processor to use for sampling.
+
+    Returns:
+    - list: A nested list containing choices based on the probabilities.
+    """
+    choices_list = []
+    if logits_processor is not None:
+        candidate_set = [1, 3, 5, 10]
+    else:
+        candidate_set = [3, 5, 8, 10]
+    for idx, item in enumerate(prob_list):
+        if item > 0.95:
+            candidate_num = candidate_set[0]
+        elif item > 0.8:
+            candidate_num = candidate_set[1]
+        elif item > 0.5:
+            candidate_num = candidate_set[2]
+        else:
+            candidate_num = candidate_set[3]
+        choices_list.extend([[0]*idx + [i] for i in range(candidate_num)])
+    return choices_list
+
 def prepare_logits_processor(
-    temperature: float = 0.0,
-    repetition_penalty: float = 0.0,
-    top_p: float = 0.0,
-    top_k: int = 0,
+        temperature: float = 0.0,
+        repetition_penalty: float = 0.0,
+        top_p: float = 0.0,
+        top_k: int = 0
 ) -> LogitsProcessorList:
     """
     Prepare the logits processor based on the provided parameters.
@@ -84,404 +118,6 @@ def prepare_logits_processor(
         if top_k > 0:
             processor_list.append(TopKLogitsWarper(top_k))
         return processor_list
-
-
-def sample(
-    logits: torch.Tensor,
-    logits_processor: LogitsProcessorList,
-    all_logits: bool = False,
-    k: int = 1,
-):
-    """
-    Sample from the provided logits using the specified processor.
-
-    Args:
-    - logits (torch.Tensor): Logits to sample from. Expected shapes:
-        - If all_logits=False: (batch_size, vocab_size) or (batch_size, seq_len, vocab_size)
-                                (if 3D, only logits for the last sequence position are used).
-                                Can also be (vocab_size) for a single unbatched distribution.
-        - If all_logits=True: (batch_size, seq_len, vocab_size) or (seq_len, vocab_size)
-                                (if 2D, batch_size is assumed to be 1).
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-    - all_logits (bool): If True, sample for all sequence positions.
-    - k (int): Number of samples to generate per distribution. Must be >= 1.
-
-    Returns:
-    - sampled_indices (torch.Tensor): Indices of the sampled tokens.
-    - sampled_probs (torch.Tensor): Conditional probabilities of the sampled tokens.
-                                     P(sample_m | sample_1, ..., sample_{m-1}).
-    - probabilities (torch.Tensor): Probabilities of all tokens (after processing by logits_processor,
-                                     before multinomial sampling).
-    """
-    if k < 1:
-        raise ValueError("k must be at least 1.")
-
-    initial_ndim = logits.ndim
-    device = logits.device
-
-    # 1. Prepare logits_to_process based on all_logits flag and input shape
-    #    Also determine the prefix shape for the output tensors.
-    if not all_logits:
-        if initial_ndim == 3:  # (batch_size, seq_len, vocab_size)
-            batch_size, _, vocab_size = logits.shape
-            logits_to_process = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
-            output_prefix_shape = (batch_size,)
-        elif initial_ndim == 2:  # (batch_size, vocab_size)
-            batch_size, vocab_size = logits.shape
-            logits_to_process = logits
-            output_prefix_shape = (batch_size,)
-        elif initial_ndim == 1:  # (vocab_size) - unbatched
-            vocab_size = logits.shape[0]
-            logits_to_process = logits.unsqueeze(0)  # Shape: (1, vocab_size)
-            output_prefix_shape = (1,)  # Will be squeezed later if initial_ndim == 1
-        else:
-            raise ValueError(
-                f"Unsupported logits shape for all_logits=False: {logits.shape}"
-            )
-    else:  # all_logits is True
-        if initial_ndim == 3:  # (batch_size, seq_len, vocab_size)
-            batch_size, seq_len, vocab_size = logits.shape
-            logits_to_process = logits.reshape(
-                -1, vocab_size
-            )  # Shape: (batch_size * seq_len, vocab_size)
-            output_prefix_shape = (batch_size, seq_len)
-        elif (
-            initial_ndim == 2
-        ):  # (seq_len, vocab_size) - assumed batch_size=1 for output shaping
-            seq_len, vocab_size = logits.shape
-            logits_to_process = logits.reshape(
-                -1, vocab_size
-            )  # Shape: (seq_len, vocab_size)
-            output_prefix_shape = (
-                seq_len,
-            )  # Output will be (seq_len, k), (seq_len, vocab_size)
-            # This implies batch_size=1 was "added and removed"
-        else:
-            raise ValueError(
-                f"Unsupported logits shape for all_logits=True: {logits.shape}. Expected 2D or 3D."
-            )
-
-    # 2. Process logits using the provided logits_processor
-    processed_logits = logits_processor(None, logits_to_process)
-
-    # 3. Calculate probabilities for all tokens (after processing)
-    full_probabilities_flat = torch.nn.functional.softmax(processed_logits, dim=-1)
-
-    # 4. Sample k indices using multinomial sampling without replacement
-    sampled_indices_flat = torch.multinomial(
-        full_probabilities_flat, k, replacement=False
-    )
-
-    # 5. Gather the probabilities of the sampled tokens from the full_probabilities distribution
-    sampled_probs_raw_flat = torch.gather(
-        full_probabilities_flat, -1, sampled_indices_flat
-    )
-
-    # 6. Adjust sampled_probs for sequential sampling without replacement (conditional probabilities)
-    # This calculates P(sample_m | sample_1, ..., sample_{m-1})
-    cumulative_sum = torch.cumsum(sampled_probs_raw_flat, dim=-1)
-    cumulative_sum_shifted = torch.cat(
-        (
-            torch.zeros(cumulative_sum.shape[0], 1, device=device),
-            cumulative_sum[:, :-1],
-        ),
-        dim=-1,
-    )
-
-    conditional_sampled_probs_flat = sampled_probs_raw_flat / (
-        1 - cumulative_sum_shifted
-    )
-
-    # Handle numerical issues as in the original snippet
-    conditional_sampled_probs_flat[torch.isinf(conditional_sampled_probs_flat)] = -1.0
-    conditional_sampled_probs_flat[torch.isnan(conditional_sampled_probs_flat)] = -1.0
-
-    # Clamp to [0,1] range. Values set to -1 become 0.
-    final_sampled_probs_flat = torch.clamp(
-        conditional_sampled_probs_flat, min=0.0, max=1.0
-    )
-
-    # 7. Reshape outputs to their final forms
-    if not all_logits:
-        # If the original input was 1D (vocab_size), squeeze the batch dimension we added.
-        if initial_ndim == 1:
-            final_sampled_indices = sampled_indices_flat.squeeze(0)
-            final_sampled_probs = final_sampled_probs_flat.squeeze(0)
-            final_full_probabilities = full_probabilities_flat.squeeze(0)
-        else:
-            # Shape: (batch_size, k) or (batch_size, vocab_size)
-            final_sampled_indices = sampled_indices_flat
-            final_sampled_probs = final_sampled_probs_flat
-            final_full_probabilities = full_probabilities_flat
-    else:  # all_logits was True
-        # Reshape flat outputs to include batch_size and seq_len dimensions (or just seq_len if input was 2D).
-        # output_prefix_shape is (batch_size, seq_len) or (seq_len,)
-        final_sampled_indices = sampled_indices_flat.view(*output_prefix_shape, k)
-        final_sampled_probs = final_sampled_probs_flat.view(*output_prefix_shape, k)
-        final_full_probabilities = full_probabilities_flat.view(
-            *output_prefix_shape, vocab_size
-        )
-
-    return final_sampled_indices, final_sampled_probs, final_full_probabilities
-
-
-# @torch.no_grad()
-def cassepc_draft(
-    model,
-    device,
-    input_ids=None,
-    new_token_num=0,
-    past_key_values_data=None,
-    current_length_data=None,
-    logits_processor=None,
-    max_new_tokens=1024,
-    eos_token_id=None,
-    current_draft_skip_mask=None,
-    K=25,
-    DET=0.7,
-):
-    # draft_tokens = []
-
-    # first_draft_input_ids = torch.tensor(
-    #     [input_ids_list[0][-1]], device=device
-    # ).unsqueeze(0)
-    first_draft_input_ids = input_ids[:, -1].unsqueeze(0)
-    is_eos = False
-
-    if current_draft_skip_mask is not None:
-        draft_tree_logits, top1_prob, is_eos = clasp_draft(
-            model,
-            first_draft_input_ids,
-            new_token_num=new_token_num,
-            past_key_values_data=past_key_values_data,
-            current_length_data=current_length_data,
-            logits_processor=logits_processor,
-            eos_token_id=eos_token_id,
-            max_new_tokens=max_new_tokens,
-            current_draft_skip_mask=current_draft_skip_mask,
-            K=K,
-            DET=DET,
-            # VC=True,
-            # all_ids=input_ids,
-        )
-        # if draft_tree_logits is None:
-        #     return [], [], is_eos
-        # draft_tokens_t = get_vanilla_tokens(draft_tree_logits)
-        # draft_tokens.extend(draft_tokens_t.tolist())
-
-    # if not is_eos:
-    #     all_ids = torch.cat((all_ids, draft_tokens_t.unsqueeze(0)), dim=-1)
-    #     max_new_draft = max_new_tokens - len(draft_tokens) - new_token_num -2
-    #     if max_new_draft > 1:
-    #         pld_candidate_tokens = find_candidate_pred_tokens(
-    #             all_ids,
-    #             max_ngram_size=3,
-    #             num_pred_tokens=min(5, max_new_draft),
-    #         )
-    #         if len(pld_candidate_tokens) > 0:
-    #             draft_tokens += pld_candidate_tokens.tolist()
-
-    return draft_tree_logits, top1_prob, is_eos
-
-
-@torch.no_grad()
-def clasp_draft(
-    model,
-    input_ids,
-    past_key_values_data=None,
-    current_length_data=None,
-    new_token_num=0,
-    logits_processor=None,
-    eos_token_id=None,
-    max_new_tokens=1024,
-    current_draft_skip_mask=None,
-    K=2,
-    DET=0.7,
-    VC=False,
-    all_ids=None,
-):
-    ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
-    next_draft_input_ids = input_ids
-    is_eos = False
-    max_new_draft = max_new_tokens - new_token_num
-    K = min(K, max_new_draft)
-    if K < 1:
-        raise ValueError("K must be at least 1.")
-
-    # Use a *cloned* KV cache structure for drafting
-    draft_past_key_values_data_list = [d.clone() for d in past_key_values_data]
-    draft_current_length_data = current_length_data.clone()
-    draft_kv_cache_list = clone_past_key_values(
-        model, draft_past_key_values_data_list, draft_current_length_data
-    )
-
-    if VC and all_ids is not None and K > 1:
-        turns = int(np.ceil(float(K) / 1.5))
-        kv_cur_len = draft_current_length_data[0].item()
-        for i in range(turns):
-            pld_candidate_tokens = find_candidate_pred_tokens(
-                all_ids,
-                max_ngram_size=5,
-                num_pred_tokens=min(5, max_new_draft),
-            )
-            cand_len = pld_candidate_tokens.size(-1)
-            next_draft_input_ids = all_ids[:, -1].unsqueeze(0)
-            if cand_len > 0:
-                # cat next_draft_input_ids with pld_candidate_tokens
-                next_draft_input_ids = torch.cat(
-                    (next_draft_input_ids, pld_candidate_tokens.unsqueeze(0)), dim=-1
-                )
-            # --verify as drafting--
-            with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
-                draft_outputs = model(
-                    input_ids=next_draft_input_ids,
-                    past_key_values=draft_kv_cache_list,
-                    output_hidden_states=False,
-                )
-            new_logits = draft_outputs.logits[:, -cand_len - 1 :]
-            if logits_processor is not None:
-                topk_index, topk_prob, op = sample(
-                    new_logits, logits_processor, all_logits=True, k=TOPK
-                )
-            else:
-                top = torch.topk(new_logits, TOPK, dim=-1)
-                topk_index, topk_prob = top.indices, top.values
-                op = None
-            selected_tokens = topk_index[:, :, 0]
-            candidate_new_tokens = next_draft_input_ids[:, -cand_len:]
-            if cand_len > 0:
-                vc_accepted_len = (
-                    (~(candidate_new_tokens == selected_tokens[:, :-1])).cumsum(dim=-1)
-                    < 1
-                ).sum()
-            else:
-                vc_accepted_len = 0
-            # accept_rate = vc_accepted_len / cand_len if cand_len > 0 else 0
-            overflow_len = vc_accepted_len - max_new_draft
-            if overflow_len > 0:
-                vc_accepted_len = vc_accepted_len - overflow_len
-            max_new_draft -= vc_accepted_len + 1
-            valid_tokens = selected_tokens[:, : vc_accepted_len + 1]
-            all_ids = torch.cat((all_ids, valid_tokens[:, 1:]), dim=-1)
-            # after unsqueeze, the shape is (1, batch_size, seq_len, x), so unbind(2)
-            ss_token.extend(
-                list(topk_index[:, : vc_accepted_len + 1].unsqueeze(0).unbind(2))
-            )
-            ss_prob.extend(
-                list(topk_prob[:, : vc_accepted_len + 1].unsqueeze(0).unbind(2))
-            )
-            ss_op.extend(
-                list(topk_prob[:, : vc_accepted_len + 1].unsqueeze(0).unbind(2))
-            )
-            origin_draft_probs = new_logits.softmax(-1)[:, : vc_accepted_len + 1]
-            argmax_prob = torch.gather(
-                origin_draft_probs, -1, input_ids.unsqueeze(-1)
-            ).squeeze(-1)
-            top1_prob.extend(argmax_prob.squeeze(0).tolist())
-            min_tpo1_prob = torch.min(argmax_prob).item()
-            # --update past_key_values--
-            new_cache_size = kv_cur_len + vc_accepted_len + 1
-            draft_current_length_data.fill_(new_cache_size)
-
-            if eos_token_id in valid_tokens.squeeze(0).tolist():
-                is_eos = True
-                break
-            if min_tpo1_prob < DET:
-                break
-            if overflow_len > 0:
-                break
-    else:
-        for i in range(K):
-            with model.self_draft(dynamic_skip_mask=current_draft_skip_mask):
-                draft_outputs = model(
-                    input_ids=next_draft_input_ids,
-                    past_key_values=draft_kv_cache_list,
-                    output_hidden_states=False,
-                )
-            draft_logits = draft_outputs.logits
-            if logits_processor is not None:
-                topk_index, topk_prob, op = sample(
-                    draft_logits, logits_processor, k=TOPK
-                )
-                next_draft_input_ids = topk_index[:, 0].unsqueeze(0)
-            else:
-                top = torch.topk(draft_logits, TOPK, dim=-1)
-                topk_index, topk_prob = top.indices, top.values
-                next_draft_input_ids = topk_index[:, :, 0]
-                op = None
-            ss_token.append(topk_index)
-            ss_prob.append(topk_prob)
-            ss_op.append(op)
-            origin_draft_probs = draft_logits.softmax(-1)
-            argmax_prob = torch.gather(
-                origin_draft_probs, -1, input_ids.unsqueeze(-1)
-            ).squeeze(-1)
-            current_threshold = argmax_prob.item()
-            top1_prob.append(current_threshold)
-            if next_draft_input_ids.item() == eos_token_id:
-                is_eos = True
-                break
-            if current_threshold < DET and i > 0:
-                break
-    return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob, is_eos
-
-
-def get_vanilla_tokens(
-    draft_tree_logits,
-):
-    return draft_tree_logits[0][:, -1, 0]
-
-
-def reset_past_key_values(past_key_values):
-    """
-    Resets the current lengths in the past key-values to zero.
-
-    This function is designed to be used during the evaluation of a baseline model.
-    It iterates through each layer's key-values and sets their current lengths to zero,
-    effectively resetting their state.
-
-    Args:
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
-
-    Returns:
-    - past_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
-    """
-    for i in range(len(past_key_values)):
-        for j in range(2):
-            past_key_values[i][j].current_length.fill_(0)
-    return past_key_values
-
-
-# --- Tree (SWIFT) ---
-def get_choices_list(prob_list, logits_processor=None):
-    """
-    Generate tree choices list based on the provided confidence.
-
-    Parameters:
-    - prob_list (list): List of probabilities.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-
-    Returns:
-    - list: A nested list containing choices based on the probabilities.
-    """
-    choices_list = []
-    if logits_processor is not None:
-        candidate_set = [1, 3, 5, 10]
-    else:
-        candidate_set = [3, 5, 8, 10]
-    for idx, item in enumerate(prob_list):
-        if item is None:
-            candidate_num = 1
-        elif item > 0.95:
-            candidate_num = candidate_set[0]
-        elif item > 0.8:
-            candidate_num = candidate_set[1]
-        elif item > 0.5:
-            candidate_num = candidate_set[2]
-        else:
-            candidate_num = candidate_set[3]
-        choices_list.extend([[0] * idx + [i] for i in range(candidate_num)])
-    return choices_list
 
 
 def pad_path(path, length, pad_value=-2):
@@ -522,6 +158,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     Returns:
     - dict: A dictionary containing buffers related to the swift structure.
     """
+
     # Sort the swift_choices based on their lengths and then their values
     sorted_swift_choices = sorted(swift_choices, key=lambda x: (len(x), x))
     swift_len = len(sorted_swift_choices) + 1
@@ -548,9 +185,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
                 continue
             ancestor_idx = []
             for c in range(len(cur_swift_choice) - 1):
-                ancestor_idx.append(
-                    sorted_swift_choices.index(cur_swift_choice[: c + 1]) + 1
-                )
+                ancestor_idx.append(sorted_swift_choices.index(cur_swift_choice[:c + 1]) + 1)
             swift_attn_mask[j + start + 1, ancestor_idx] = 1
         start += depth_counts[i]
 
@@ -578,7 +213,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     swift_position_ids = torch.zeros(swift_len, dtype=torch.long)
     start = 0
     for i in range(len(depth_counts)):
-        swift_position_ids[start + 1 : start + depth_counts[i] + 1] = i + 1
+        swift_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
         start += depth_counts[i]
 
     # Generate retrieval indices for swift structure verification
@@ -591,22 +226,15 @@ def generate_swift_buffers(swift_choices, device="cuda"):
             continue
         else:
             for c in range(len(cur_swift_choice)):
-                retrieve_indice.append(
-                    sorted_swift_choices.index(cur_swift_choice[: c + 1])
-                )
-                retrieve_paths.append(cur_swift_choice[: c + 1])
+                retrieve_indice.append(sorted_swift_choices.index(cur_swift_choice[:c + 1]))
+                retrieve_paths.append(cur_swift_choice[:c + 1])
         retrieve_indices_nest.append(retrieve_indice)
     max_length = max([len(x) for x in retrieve_indices_nest])
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
     retrieve_indices = retrieve_indices + 1
-    retrieve_indices = torch.cat(
-        [
-            torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long),
-            retrieve_indices,
-        ],
-        dim=1,
-    )
+    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices],
+                                 dim=1)
 
     maxitem = retrieve_indices.max().item() + 5
 
@@ -664,9 +292,219 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     return swift_buffers
 
 
-def generate_candidates(
-    swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor
+def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data, logits_processor=None):
+    """
+    Initializes the swift structure for a given model.
+
+    This function performs the following operations:
+    1. Forward pass through the model to obtain the full model logits and swift drafting logits.
+
+    Args:
+    - input_ids (torch.Tensor): The input tensor containing token ids.
+    - model (LLM): The model containing the full LLM model.
+    - max_new_tokens (int): Maximum number of tokens to generate.
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
+    - logits_processor (LogitsProcessorList): Processor to use for sampling.
+
+    Returns:
+    - swift_logits (torch.Tensor): Logits associated with the swift structure.
+    - sample_token (torch.Tensor): Token sampled from probability distribution.
+    - top1_prob (float): Probability of the sampled token.
+    """
+    with torch.inference_mode():
+        # Pass input through the base model
+        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        # Obtain the logits from the full model
+        if logits_processor is not None:
+            last_logits = logits[:, -1]
+            last_logits = logits_processor(None, last_logits)
+            probabilities = torch.nn.functional.softmax(last_logits, dim=1)
+            sample_token = torch.multinomial(probabilities, 1)
+        else:
+            sample_token = torch.argmax(logits[:, -1])
+            sample_token = sample_token[None, None]
+        # Pass input through the swift structure (sub-layer set)
+        swift_logits, top1_prob = swift_draft(
+            model,
+            input_ids=sample_token,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            max_new_tokens=max_new_tokens,
+            logits_processor=logits_processor,
+        )
+    return swift_logits, sample_token, top1_prob
+
+
+def swift_verify(
+        model,
+        input_ids=None,
+        past_key_values=None,
+        position_ids=None,
 ):
+    """
+    Verify the swift structure using the provided model and input.
+
+    Args:
+    - input_ids (torch.Tensor): The input tensor containing token ids.
+    - model (LLM): The model containing the full LLM model.
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
+    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
+
+    Returns:
+    - outputs (tuple): Contains the outputs from the model.
+    - orig (torch.Tensor): Original logits from the full model.
+    """
+    with torch.inference_mode():
+        # Pass input through the base model
+        outputs = model.model(
+            input_ids=input_ids,
+            attention_mask=None,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        orig = model.lm_head(outputs[0])
+
+    return outputs, orig
+
+
+def sample(logits, logits_processor, k=1):
+    """
+    Sample from the provided logits using the specified processor.
+
+    Args:
+    - logits (torch.Tensor): Logits to sample from.
+    - logits_processor (LogitsProcessorList): Processor to use for sampling.
+    - k (int): Number of samples to generate.
+
+    Returns:
+    - sampled_indices (torch.Tensor): Indices of the sampled tokens.
+    - sampled_probs (torch.Tensor): Probabilities of the sampled tokens.
+    - probabilities (torch.Tensor): Probabilities of all tokens.
+    """
+    logits = logits.view(-1, logits.size(-1)) # default batch size 1
+    logits = logits_processor(None, logits)
+    probabilities = torch.nn.functional.softmax(logits, dim=-1)
+
+    sampled_indices = torch.multinomial(probabilities, k, replacement=False)
+    sampled_probs = torch.gather(probabilities, -1, sampled_indices)
+
+    cumulative_sum = torch.cumsum(sampled_probs, dim=-1)
+    cumulative_sum = torch.cat(
+        (torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device), cumulative_sum[:, :-1]), dim=-1)
+
+    sampled_probs = sampled_probs / (1 - cumulative_sum)
+    sampled_probs[torch.isinf(sampled_probs)] = -1
+    sampled_probs[torch.isnan(sampled_probs)] = -1
+
+    sampled_probs = torch.clamp(sampled_probs, min=0.0, max=1.0)
+
+    return sampled_indices, sampled_probs, probabilities
+
+
+@torch.no_grad()
+def swift_draft(
+        model,
+        input_ids=None,
+        new_token_num=0,
+        past_key_values_data=None,
+        current_length_data=None,
+        max_new_tokens=1024,
+        position_ids=None,
+        max_step_draft=25,
+        logits_processor=None,
+        stop_threshold=0.8,
+):
+    """
+    Draft new tokens using the swift structure.
+
+    Args:
+    - model (LLM): The model containing the full LLM model.
+    - input_ids (torch.Tensor): The input tensor containing token ids.
+    - new_token_num (int): Counter for the new tokens added during inference.
+    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
+    - max_new_tokens (int): Maximum number of tokens to generate.
+    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
+    - max_step_draft (int): Maximum number of draft steps to take.
+    - logits_processor (LogitsProcessorList): Processor to use for sampling.
+    - stop_threshold (float): Threshold for stopping the draft process.
+
+    Returns:
+    - draft_logits (torch.Tensor): Logits associated with the draft steps.
+    - top1_prob (float): Probability of the sampled token.
+    """
+    draft_past_key_values_data = []
+    for i in range(len(past_key_values_data)):
+        draft_past_key_values_data.append(past_key_values_data[i].clone())
+    draft_current_length_data = current_length_data.clone()
+    draft_past_key_values = clone_past_key_values(model, draft_past_key_values_data, draft_current_length_data)
+
+    ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
+    with torch.inference_mode():
+        for step_draft in range(max_step_draft):
+            with model.self_draft():
+                draft_outputs = model.model(
+                    input_ids=input_ids,
+                    attention_mask=None,
+                    past_key_values=draft_past_key_values,
+                    position_ids=position_ids,
+                )
+            current_draft_logits = model.lm_head(draft_outputs[0])
+            if logits_processor is not None:
+                topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
+                input_ids = topk_index[:, 0].unsqueeze(0)
+            else:
+                top = torch.topk(current_draft_logits, TOPK, dim=-1)
+                topk_index, topk_prob = top.indices, top.values
+                input_ids = topk_index[:, :, 0]
+                op = None
+            ss_token.append(topk_index)
+            ss_prob.append(topk_prob)
+            ss_op.append(op)
+            origin_draft_probs = current_draft_logits.softmax(-1)
+            argmax_prob = torch.gather(origin_draft_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
+            current_threshold = argmax_prob.item()
+            top1_prob.append(current_threshold)
+            if current_threshold < stop_threshold or new_token_num + step_draft + 2 >= max_new_tokens:
+                break
+    return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
+
+
+def reset_swift_mode(
+        model,
+):
+    """
+    Resets the swift settings to their initial state.
+
+    This function ensures that after any operations involving swift,
+    the model's the swift attention mask return to their default state.
+    """
+    model.model.swift_mask = None
+
+
+def reset_past_key_values(past_key_values):
+    """
+    Resets the current lengths in the past key-values to zero.
+
+    This function is designed to be used during the evaluation of a baseline model.
+    It iterates through each layer's key-values and sets their current lengths to zero,
+    effectively resetting their state.
+
+    Args:
+    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
+
+    Returns:
+    - past_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
+    """
+    for i in range(len(past_key_values)):
+        for j in range(2):
+            past_key_values[i][j].current_length.fill_(0)
+    return past_key_values
+
+
+def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor):
     """
     Generate candidates based on provided logits and indices.
 
@@ -695,13 +533,7 @@ def generate_candidates(
     tree_candidates = candidates[tree_indices]
 
     # Extend the tree candidates by appending a zero.
-    tree_candidates_ext = torch.cat(
-        [
-            tree_candidates,
-            torch.zeros((1), dtype=torch.long, device=tree_candidates.device),
-        ],
-        dim=0,
-    )
+    tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
 
     # Retrieve the cartesian candidates using the retrieve indices.
     cart_candidates = tree_candidates_ext[retrieve_indices]
@@ -709,23 +541,12 @@ def generate_candidates(
     if logits_processor is not None:
         candidates_tree_prob = swift_logits[1]
         candidates_prob = torch.cat(
-            [
-                torch.ones(1, device=candidates_tree_prob.device, dtype=torch.float32),
-                candidates_tree_prob.view(-1),
-            ],
-            dim=-1,
-        )
+            [torch.ones(1, device=candidates_tree_prob.device, dtype=torch.float32), candidates_tree_prob.view(-1)],
+            dim=-1)
 
         tree_candidates_prob = candidates_prob[tree_indices]
         tree_candidates_prob_ext = torch.cat(
-            [
-                tree_candidates_prob,
-                torch.ones(
-                    (1), dtype=torch.float32, device=tree_candidates_prob.device
-                ),
-            ],
-            dim=0,
-        )
+            [tree_candidates_prob, torch.ones((1), dtype=torch.float32, device=tree_candidates_prob.device)], dim=0)
         cart_candidates_prob = tree_candidates_prob_ext[retrieve_indices]
     else:
         cart_candidates_prob = None
@@ -736,12 +557,12 @@ def generate_candidates(
 
 
 def tree_decoding(
-    model,
-    tree_candidates,
-    past_key_values,
-    swift_position_ids,
-    input_ids,
-    retrieve_indices,
+        model,
+        tree_candidates,
+        past_key_values,
+        swift_position_ids,
+        input_ids,
+        retrieve_indices,
 ):
     """
     Decode the tree candidates using the provided model and reorganize the logits.
@@ -762,30 +583,28 @@ def tree_decoding(
     position_ids = swift_position_ids + input_ids.shape[1]
 
     # Use the model to decode the tree candidates.
-    outputs = model(
+    outputs, tree_logits = swift_verify(
+        model,
         tree_candidates,
         past_key_values=past_key_values,
         position_ids=position_ids,
-        output_hidden_states=True,
     )
-    tree_logits = outputs.logits
 
     # Reorder the obtained logits and hidden states based on the retrieve_indices to ensure consistency with some reference ordering.
     logits = tree_logits[0, retrieve_indices]
-    
-    model.model.swift_mask = None # reset attn mask
+
     return logits, outputs
 
 
 def evaluate_posterior(
-    logits: torch.Tensor,
-    candidates: torch.Tensor,
-    logits_processor,
-    cart_candidates_prob,
-    op,
-    p_indices,
-    tree_candidates,
-    b_indices,
+        logits: torch.Tensor,
+        candidates: torch.Tensor,
+        logits_processor,
+        cart_candidates_prob,
+        op,
+        p_indices,
+        tree_candidates,
+        b_indices
 ):
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
@@ -811,7 +630,7 @@ def evaluate_posterior(
     if logits_processor is None:
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
-            candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
+                candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
@@ -867,9 +686,7 @@ def evaluate_posterior(
                         max_id = gtp.argmax()
                         gtp = gtp - q
                         gtp[gtp < 0] = 0
-                        if torch.equal(
-                            gtp.cpu(), torch.zeros(gtp.shape)
-                        ):  # multinomial error
+                        if torch.equal(gtp.cpu(), torch.zeros(gtp.shape)): # multinomial error
                             gtp[max_id] = 1
                         gtp = gtp / (gtp.sum() + 1e-6)
                         adjustflag = True
@@ -878,21 +695,177 @@ def evaluate_posterior(
         else:
             gt_logits = logits[best_candidate, accept_length - 1]
             sample_p = torch.softmax(gt_logits, dim=0)
-        
         return best_candidate, accept_length - 1, sample_p
 
 
+def get_next_point_to_probe(attn_skip_layers, mlp_skip_layers, num_hidden_layers=40):
+    """
+    Get the next point to probe of Bayes Optimization based on the skip layers.
+    Args:
+    - skip_attn_layers (list): List of indices of the skipped attention layers.
+    - skip_mlp_layers (list): List of indices of the skipped MLP layers.
+    - num_hidden_layers (int): Number of hidden layers in the model.
+
+    Returns:
+    - dict: A dictionary containing the next point to probe.
+    """
+    next_point_to_probe = {}
+    for i in range(num_hidden_layers - 2):
+        if (i+1) in attn_skip_layers:
+            next_point_to_probe[f"x{i}"] = 1.0
+        else:
+            next_point_to_probe[f"x{i}"] = 0.0
+
+    for i in range(num_hidden_layers - 2, (num_hidden_layers - 2) * 2):
+        if (i - (num_hidden_layers - 2) + 1) in mlp_skip_layers:
+            next_point_to_probe[f"x{i}"] = 1.0
+        else:
+            next_point_to_probe[f"x{i}"] = 0.0
+
+    return next_point_to_probe
+
+
+def layer_bayes_search(optimizer, utility, num_skip_layers=34, num_hidden_layers=40):
+    """
+    Perform Bayesian optimization to select the next point to probe based on the utility function.
+    Args:
+    - optimizer (BayesianOptimization): The optimizer used for Bayesian optimization.
+    - utility (function): The utility function used for Bayesian optimization.
+    - num_skip_layers (int): Number of layers to skip.
+    - num_hidden_layers (int): Number of hidden layers in the model.
+
+    Returns:
+    - dict: A dictionary containing the next point to probe.
+    - list: List of indices of the skipped attention layers.
+    - list: List of indices of the skipped MLP layers.
+    """
+    next_point_to_probe = optimizer.suggest(utility)
+    sorted_point = sorted(next_point_to_probe.items(), reverse=True, key=lambda item: item[1])
+    skip_layer_list = [k for (k, v) in sorted_point[:num_skip_layers]]
+    attn_skip_layers = []
+    mlp_skip_layers = []
+    for i in range(num_hidden_layers - 2):
+        if f"x{i}" in skip_layer_list:
+            attn_skip_layers.append(i + 1)
+    for i in range(num_hidden_layers - 2, (num_hidden_layers - 2) * 2):
+        if f"x{i}" in skip_layer_list:
+            mlp_skip_layers.append(i - (num_hidden_layers - 2) + 1)
+
+    return next_point_to_probe, attn_skip_layers, mlp_skip_layers
+
+
+def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
+    """
+    Randomly select layers for skipping, always keep the first and last layer
+    Args:
+    - num_skip_layers (int): Number of layers to skip.
+    - num_hidden_layers (int): Number of hidden layers in the model.
+
+    Returns:
+    - list: List of indices of the skipped attention layers.
+    - list: List of indices of the skipped MLP layers.
+    """
+    skip_layer_list = np.random.choice((num_hidden_layers-2) * 2, num_skip_layers, replace=False)
+    attn_skip_layers = []
+    mlp_skip_layers = []
+    for i in range(num_hidden_layers - 2):
+        if i in skip_layer_list:
+            attn_skip_layers.append(i + 1)
+    for i in range(num_hidden_layers - 2, (num_hidden_layers - 2) * 2):
+        if i in skip_layer_list:
+            mlp_skip_layers.append(i - (num_hidden_layers - 2) + 1)
+    return attn_skip_layers, mlp_skip_layers
+
+
+def swift_optimization(model, output_ids, input_past_key_values_data,
+            input_current_length_data, new_token_num, statistics, optimizer=None, utility=None, position_ids=None):
+    """
+    Perform an optimization to find the optimal layer set for the model based on the draft matchness.
+
+    Args:
+    - model (LLM): The model containing the full LLM model.
+    - output_ids (torch.Tensor): The output token sequences.
+    - input_past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
+    - input_current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
+    - new_token_num (int): Counter for the new tokens added during inference.
+    - statistics (dict): Dictionary containing the optimization statistics.
+    - optimizer (BayesianOptimization): The optimizer used for Bayesian optimization.
+    - utility (function): The utility function used for Bayesian optimization.
+    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
+    """
+    # Avoid modifying the input_ids in-place
+    generate_ids = output_ids.clone()
+
+    cur_past_key_values_data = []
+    for i in range(len(input_past_key_values_data)):
+        cur_past_key_values_data.append(input_past_key_values_data[i].clone())
+    cur_current_length_data = input_current_length_data.clone()
+    input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
+
+    # preserve original layer set
+    origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = model.get_skip_layers()
+
+    skip_layer_num = int((model.config.num_hidden_layers - 2) * 2 * statistics["skip_ratio"])
+
+    # select new layer set
+    if (statistics["opt_iter"] + 1) % statistics["bayes_interval"] == 0 and statistics["bayes"]:
+        logging.info("*" * 30 + "Bayes Search!" + "*" * 30)
+        next_point_to_probe, _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_bayes_search(
+            optimizer, utility, num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
+    else:
+        _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_random_search(
+            num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
+        next_point_to_probe = get_next_point_to_probe(_attn_skip_layer_id_set, _mlp_skip_layer_id_set, model.config.num_hidden_layers)
+    model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
+
+    # parallel drafting on previous decoded results
+    with torch.inference_mode():
+        with model.self_draft():
+            step_end = statistics["context_window"] + 1
+            parallel_draft_output = model.model(input_ids=generate_ids[:, :step_end],
+                                                attention_mask=None,
+                                                past_key_values=input_past_key_values,
+                                                position_ids=position_ids)
+    parallel_draft_logits = model.lm_head(parallel_draft_output[0])
+    parallel_draft_output_ids = torch.argmax(parallel_draft_logits, dim=-1)
+    verified_token_num = (parallel_draft_output_ids[:, :-1] == generate_ids[:, 1:step_end].to(parallel_draft_output_ids.device)).sum(-1).item()
+    drafted_token_num = generate_ids[:, 1:step_end].size(-1)
+    score = verified_token_num / drafted_token_num
+    logging.info('opt_iter {}, matchness {:.4f}'.format(statistics["opt_iter"], score))
+
+    # update the bayes optimizer
+    optimizer.register(params=next_point_to_probe, target=score)
+
+    if score > statistics["origin_score"]:
+        logging.info("=" * 30 + 'matchness changed from {:.4f} to {:.4f}'.format(statistics["origin_score"], score) + "=" * 30)
+        statistics["origin_score"] = score
+        statistics["tolerance_iter"] = 0
+        if score > statistics["max_score"]:
+            statistics["optimization"] = False  # stop optimization
+            logging.info("=" * 30 + 'Optimization Stopped because the score reaches the expected number!' + "=" * 30)
+    else:
+        model.set_skip_layers(origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set)  # choose the better one
+        statistics["tolerance_iter"] += 1
+    statistics["opt_iter"] += 1
+    if statistics["tolerance_iter"] > statistics["max_tolerance_iter"]:
+        statistics["optimization"] = False  # stop optimization
+        logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the max tolerance!' + "=" * 30)
+    if statistics["opt_iter"] > statistics["max_opt_iter"]:
+        statistics["optimization"] = False  # stop optimization
+        logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the maximum!' + "=" * 30)
+
+
 def update_inference_inputs(
-    input_ids,
-    candidates,
-    best_candidate,
-    accept_length,
-    retrieve_indices,
-    logits_processor,
-    new_token_num,
-    past_key_values_data_list,
-    current_length_data,
-    sample_p,
+        input_ids,
+        candidates,
+        best_candidate,
+        accept_length,
+        retrieve_indices,
+        logits_processor,
+        new_token_num,
+        past_key_values_data_list,
+        current_length_data,
+        sample_p,
 ):
     """
     Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
@@ -918,26 +891,18 @@ def update_inference_inputs(
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (
-        retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
-        [
-            input_ids,
-            candidates[None, best_candidate, : accept_length + 1].to(input_ids.device),
-        ],
-        dim=-1,
+        [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
     for past_key_values_data in past_key_values_data_list:
-        tgt = past_key_values_data[
-            ..., select_indices.to(past_key_values_data.device), :
-        ]
+        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
         # Destination tensor where the relevant past information will be stored
-        dst = past_key_values_data[
-            ..., prev_input_len : prev_input_len + tgt.shape[-2], :
-        ]
+        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
         # Copy relevant past information from the source to the destination
         dst.copy_(tgt, non_blocking=True)
 
@@ -955,265 +920,3 @@ def update_inference_inputs(
     new_token_num += accept_length + 1
 
     return input_ids, new_token_num, sample_token
-
-
-# --- Core CLaSp DP Algorithm ---
-def cosine_similarity(vec1, vec2):
-    """Calculates cosine similarity between two vectors."""
-    # Ensure vectors are normalized for efficiency if done frequently
-    vec1_norm = vec1 / torch.linalg.norm(vec1)
-    vec2_norm = vec2 / torch.linalg.norm(vec2)
-    return torch.dot(vec1_norm, vec2_norm)
-
-
-def normalize_tensor(tensor):
-    """Normalizes a tensor (vector or rows of a matrix)."""
-    if tensor.ndim == 1:
-        norm = torch.linalg.norm(tensor)
-        return tensor / norm if norm > 0 else tensor
-    elif tensor.ndim == 2:
-        norm = torch.linalg.norm(tensor, dim=1, keepdim=True)
-        return tensor / torch.where(
-            norm > 0, norm, torch.tensor(1.0, device=tensor.device)
-        )
-    else:
-        # Handle batch dim if needed, assuming (batch, seq, hidden) -> (batch*seq, hidden)
-        original_shape = tensor.shape
-        tensor_2d = tensor.view(-1, original_shape[-1])
-        norm = torch.linalg.norm(tensor_2d, dim=1, keepdim=True)
-        normalized_2d = tensor_2d / torch.where(
-            norm > 0, norm, torch.tensor(1.0, device=tensor.device)
-        )
-        return normalized_2d.view(original_shape)
-
-
-# Copied from transformers.models.bart.modeling_bart._make_causal_mask
-def _make_causal_mask_id(
-    input_ids_shape: torch.Size,
-    dtype: torch.dtype,
-    device: torch.device,
-    past_key_values_length: int = 0,
-):
-    """
-    Create a causal mask for bi-directional self-attention.
-
-    Args:
-        input_ids_shape (torch.Size): The shape of input_ids tensor, typically (batch_size, tgt_len).
-        dtype (torch.dtype): The data type of the mask.
-        device (torch.device): The device on which the mask will be placed.
-        past_key_values_length (int, optional): The length of past key values. Default is 0.
-
-    Returns:
-        torch.Tensor: The causal mask tensor.
-    """
-    bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    # Set the diagonal to 0, allowing each position to attend to itself
-    mask.fill_diagonal_(0)
-    mask = mask.to(dtype)
-
-    if past_key_values_length > 0:
-        mask = torch.cat(
-            [
-                torch.zeros(
-                    tgt_len, past_key_values_length, dtype=dtype, device=device
-                ),
-                mask,
-            ],
-            dim=-1,
-        )
-    return mask[None, None, :, :].expand(
-        bsz, 1, tgt_len, tgt_len + past_key_values_length
-    )
-
-
-@torch.no_grad()
-def CLaSp_Skip_Layer_Strategy_SeqParallel(
-    L, M, hidden_states_H, model_layers, past_key_values, device
-):
-    """
-    Implements the CLaSp DP algorithm with Sequence Parallel optimization.
-
-    Args:
-        L: Total number of decoder layers.
-        M: Target number of layers to skip.
-        hidden_states_H: List/Tuple of hidden states {h_0, ..., h_L} from verify pass.
-        model_layers: The list/nn.ModuleList of the verify model's layers.
-        past_key_values: The past key values for the model.
-        device: The torch device.
-
-    Returns:
-        S: A boolean torch tensor of size L indicating skipped layers.
-    """
-    model_dtype = next(
-        model_layers[0].parameters()
-    ).dtype  # Get model dtype dynamically
-    # d = hidden_states_H[0].shape[-1]
-    past_key_values_length = 0
-    for past_key_value in past_key_values:
-        if past_key_value is not None:
-            past_key_values_length = past_key_value[0].shape[2]
-            break
-
-    g = {}
-    parent = {}
-    g[(0, 0)] = hidden_states_H[0].to(device)
-
-    # --- Dynamic Programming with Sequence Parallel ---
-    for i in range(1, L + 1):
-        g[(i, 0)] = hidden_states_H[i].to(device)
-        parent[(i, 0)] = (i - 1, 0, False)  # No skip for j=0
-        layer_func = model_layers[i - 1]
-        max_prev_skips = min(i - 1, M)
-
-        # --- Parallel Layer Computation ---
-        # 1. Identify states needing computation by layer i-1
-        states_to_process_indices_j = []
-        states_to_process_tensors = []
-        for j_prev in range(1, max_prev_skips + 1):
-            if (i - 1, j_prev) in g:
-                states_to_process_indices_j.append(j_prev)
-                states_to_process_tensors.append(g[(i - 1, j_prev)])
-
-        computed_states_map = {}  # Map j -> computed state f_{i-1}(g(i-1, j))
-
-        if states_to_process_tensors:
-            # 2. Prepare input sequence and attention mask
-            num_parallel_j = len(states_to_process_indices_j)
-            # Stack along a new dimension, then unsqueeze for batch dim = 1
-            # Input shape expected by layer: (batch_size, seq_len, hidden_dim)
-            input_sequence = torch.stack(states_to_process_tensors, dim=0).unsqueeze(
-                0
-            )  # Shape: (1, num_parallel_j, d)
-
-            # 3. Create the "special mask matrix"
-            # Mask needs shape (batch_size, num_heads, seq_len, seq_len) or (batch_size, 1, seq_len, seq_len)
-            # Using additive mask (0 for attend, -inf for mask)
-            attn_mask = _make_causal_mask_id(
-                input_sequence.shape[:2],
-                dtype=model_dtype,
-                device=device,
-                past_key_values_length=past_key_values_length,
-            )
-
-            # 4. Call the layer ONCE with the prepared sequence and mask
-            # reuse KV cache for all parallel computations
-            past_key_value = (
-                past_key_values[i - 1] if past_key_values is not None else None
-            )
-            # position ids all set to past_key_values_length
-            position_ids = torch.full(
-                (1, num_parallel_j), past_key_values_length, device=device
-            ).long()
-            layer_outputs = layer_func(
-                input_sequence,
-                attention_mask=attn_mask,
-                past_key_value=past_key_value,
-                position_ids=position_ids,
-                output_attentions=False,
-            )
-            # Output hidden state shape: (1, num_parallel_j, d)
-            output_states_sequence = layer_outputs[0].squeeze(
-                0
-            )  # Shape: (num_parallel_j, d)
-
-            # 5. Store the computed states mapped back to their original 'j' index
-            for k, j_orig in enumerate(states_to_process_indices_j):
-                computed_states_map[j_orig] = output_states_sequence[k]
-        # --- End Parallel Layer Computation ---
-
-        # max_j = min(i - 1, M)
-        # --- Update DP table using pre-computed states ---
-        for j in range(1, max_prev_skips + 1):
-            norm_hi = None
-            # Option 1: Arrive via NOT skipping layer i-1 (from state (i-1, j))
-            state_if_not_skipped = None
-            sim_if_not_skipped = -float("inf")
-            # Check if the required state was computed in the parallel step
-            if j in computed_states_map:
-                norm_hi = normalize_tensor(g[(i, 0)])
-                state_if_not_skipped = computed_states_map[j]
-                sim_if_not_skipped = cosine_similarity(
-                    normalize_tensor(state_if_not_skipped), norm_hi
-                )
-
-            # Option 2: Arrive via SKIPPING layer i-1 (from state (i-1, j-1))
-            state_if_skipped = None
-            sim_if_skipped = -float("inf")
-            if (i - 1, j - 1) in g:
-                norm_hi = normalize_tensor(g[(i, 0)]) if norm_hi is None else norm_hi
-                state_if_skipped = g[(i - 1, j - 1)]
-                sim_if_skipped = cosine_similarity(
-                    normalize_tensor(state_if_skipped), norm_hi
-                )
-
-            # Decide based on cosine similarity
-            # Important: Handle cases where one path is impossible (e.g., j=0 can't come from j-1)
-            if state_if_not_skipped is None and state_if_skipped is None:
-                continue  # This state (i, j) is unreachable
-
-            if state_if_not_skipped is not None and (
-                state_if_skipped is None or sim_if_not_skipped >= sim_if_skipped
-            ):
-                # Choose the "not skipped" path if it's possible and better/equal, OR if "skipped" path is impossible
-                g[(i, j)] = state_if_not_skipped
-                parent[(i, j)] = (i - 1, j, False)
-            elif state_if_skipped is not None:
-                # Choose the "skipped" path if it's possible and strictly better, OR if "not skipped" path was impossible
-                g[(i, j)] = state_if_skipped
-                parent[(i, j)] = (i - 1, j - 1, True)
-        # When skipping all:
-        if i <= M:
-            # If we can skip all layers, we can just take the last layer's output
-            g[(i, i)] = g[(i - 1, i - 1)]
-            parent[(i, i)] = (i - 1, i - 1, True)
-
-    # --- Backtracking ---
-    S = torch.zeros(L, dtype=torch.bool, device=device)
-    current_i, current_j = L, M
-
-    if (L, M) not in g:
-        # Fallback logic to find best available j_final
-        best_final_j = -1
-        max_final_sim = -float("inf")
-        h_L = hidden_states_H[L].to(device)
-        for j_final in range(M + 1):
-            if (L, j_final) in g:
-                sim = cosine_similarity(
-                    normalize_tensor(g[(L, j_final)]), normalize_tensor(h_L)
-                )
-                if sim > max_final_sim:
-                    max_final_sim = sim
-                    best_final_j = j_final
-        if best_final_j != -1:
-            current_j = best_final_j
-            logging.infor(
-                f"CLaSp DP: Target skips M={M} not reached. Using best j={current_j} at final layer."
-            )
-        else:
-            logging.infor(
-                "CLaSp DP: No valid path found in DP table during backtracking."
-            )
-            return S
-
-    while current_i > 0:
-        if (current_i, current_j) not in parent:
-            logging.info(
-                f"CLaSp DP: Backtracking error - state ({current_i}, {current_j}) has no parent."
-            )
-            break
-        prev_i, prev_j, was_skipped = parent[(current_i, current_j)]
-        if was_skipped:
-            S[current_i - 1] = True
-        current_i, current_j = prev_i, prev_j
-
-    # Sanity check for number of skips
-    actual_skips = torch.sum(S).item()
-    if actual_skips > M:  # Check if backtracking selected more skips than allowed
-        logging.info(
-            f"CLaSp DP Backtracking resulted in {actual_skips} skips, but target was {M}. Check logic."
-        )
-        # Optional: Implement a correction mechanism if this happens, e.g., un-skip layers
-        # with lowest impact based on some heuristic, though this indicates a DP logic issue.
-
-    return S
