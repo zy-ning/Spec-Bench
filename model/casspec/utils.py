@@ -630,7 +630,9 @@ def evaluate_posterior(
     """
     # Greedy decoding based on temperature value
     if logits_processor is None:
-        logging.info("evaling Candidates: " + str(candidates))
+        logging.info("Evaluating posterior with greedy decoding.")
+        logging.info("Candidates: " + str(candidates))
+        logging.info("Tree Candidates: " + str(tree_candidates))
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
@@ -643,6 +645,7 @@ def evaluate_posterior(
             best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
         else:
             best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
+        logging.info(f"Best candidate: {best_candidate}, Accept length: {accept_length}")
         return best_candidate, accept_length, logits[best_candidate, accept_length]
     else:
         cart_candidates_prob = cart_candidates_prob.to(logits.device)
