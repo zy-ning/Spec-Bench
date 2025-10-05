@@ -1,4 +1,5 @@
 import argparse
+import copy
 import logging
 import random
 import time
@@ -17,9 +18,9 @@ from transformers import (
 from evaluation.eval import reorg_answer_file, run_eval
 from model.casspec.kv_cache import initialize_past_key_values
 from model.casspec.modeling_llama import LlamaForCausalLM
-from model.casspec.utils import (
+from model.pld.pld import find_candidate_pred_tokens
+from model.swift.utils import (
     evaluate_posterior,
-    generate_candidates,
     generate_swift_buffers,
     get_cache_configuration,
     get_choices_list,
@@ -34,10 +35,6 @@ from model.casspec.utils import (
 )
 
 first_acc_rates = []
-
-import copy
-
-from model.casspec.utils import find_candidate_pred_tokens  # Add this import
 
 
 def add_pld_paths_to_swift_buffers(
@@ -650,25 +647,19 @@ if __name__ == "__main__":
         "--use-pld",
         action="store_true",
         default=False,
-        help="Enable PLD candidate augmentation"
+        help="Enable PLD candidate augmentation",
     )
     parser.add_argument(
-        "--pld-max-ngram",
-        type=int,
-        default=3,
-        help="Max n-gram size for PLD"
+        "--pld-max-ngram", type=int, default=3, help="Max n-gram size for PLD"
     )
     parser.add_argument(
-        "--pld-num-tokens",
-        type=int,
-        default=7,
-        help="Number of tokens PLD predicts"
+        "--pld-num-tokens", type=int, default=7, help="Number of tokens PLD predicts"
     )
     parser.add_argument(
         "--pld-max-depths",
         type=int,
         default=2,
-        help="Maximum tree depths to add PLD paths"
+        help="Maximum tree depths to add PLD paths",
     )
 
     args = parser.parse_args()
@@ -774,14 +765,16 @@ if __name__ == "__main__":
 
     def swift_forward_wrapper(inputs, model, tokenizer, max_new_tokens, **kwargs):
         return swift_forward(
-            inputs, model, tokenizer, max_new_tokens,
+            inputs,
+            model,
+            tokenizer,
+            max_new_tokens,
             use_pld=args.use_pld,
             pld_max_ngram_size=args.pld_max_ngram,
             pld_num_pred_tokens=args.pld_num_tokens,
             max_pld_depths=args.pld_max_depths,
-            **kwargs
+            **kwargs,
         )
-
 
     run_eval(
         model=model,
