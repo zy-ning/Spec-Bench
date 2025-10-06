@@ -47,56 +47,51 @@ def add_pld_paths_to_swift_buffers(
     max_pld_depths=3,
 ):
     """
-    Add PLD candidate paths to existing SWIFT buffers.
-
-    Args:
-        swift_buffers: Original SWIFT buffers
-        input_ids: Current input sequence
-        sample_token: First greedy token from SWIFT
-        swift_logits: SWIFT draft logits (tokens, probs, ops)
-        pld_max_ngram_size: Max n-gram size for PLD matching
-        pld_num_pred_tokens: Number of tokens PLD should predict
-        max_pld_depths: Maximum tree depth to add PLD paths (0=root, 1=after 1st token, etc.)
-
-    Returns:
-        enhanced_candidates: Extended candidate tensor with PLD tokens
-        enhanced_buffers: Updated SWIFT buffers with PLD paths added
+    Add PLD candidate paths to existing SWIFT buffers with proper attention masks.
     """
     device = swift_buffers["tree_indices"].device
     retrieve_indices = swift_buffers["retrieve_indices"]
     tree_indices = swift_buffers["tree_indices"]
+    swift_attn_mask = swift_buffers["swift_attn_mask"]
+    swift_position_ids = swift_buffers["swift_position_ids"]
 
-    # Prepare to collect PLD tokens and paths
-    pld_token_sequences = []
-    pld_retrieve_paths = []
+    logging.info(f"\n{'=' * 60}")
+    logging.info("PLD AUGMENTATION START")
+    logging.info(f"Input length: {input_ids.shape[1]}")
+    logging.info(f"Original SWIFT paths: {retrieve_indices.shape[0]}")
+    logging.info(f"Original tree size: {len(tree_indices)}")
 
-    # Get SWIFT tokens for building extended contexts
-    swift_tokens = swift_logits[0]  # Shape: [num_draft_tokens, TOPK]
+    # Get SWIFT tokens
+    swift_tokens = swift_logits[0]  # Shape: [num_draft_steps, TOPK]
+    logging.info(f"SWIFT draft tokens shape: {swift_tokens.shape}")
 
-    # --- Generate PLD candidates at different depths ---
+    # Collect PLD sequences
+    pld_sequences = []
+
     for depth in range(min(max_pld_depths, len(swift_tokens) + 1)):
+        # Build context for PLD
         if depth == 0:
-            # PLD from current position (root)
             context = input_ids
-            prefix_tokens = []
+            prefix_indices = []
+            logging.info(f"\nPLD at depth {depth} (from root):")
         else:
-            # PLD after following greedy path to this depth
-            # Greedy path = first token from sample_token + first tokens from swift_tokens
+            # Build greedy path: sample_token + first choice at each subsequent level
             if depth == 1:
-                greedy_tokens = sample_token[0]  # First token
+                greedy_tokens = sample_token[0]
             else:
-                # First token + subsequent greedy selections
                 greedy_tokens = torch.cat(
-                    [
-                        sample_token[0],
-                        swift_tokens[: depth - 1, 0],  # First choice at each level
-                    ]
+                    [sample_token[0], swift_tokens[: depth - 1, 0]]
                 )
 
             context = torch.cat([input_ids, greedy_tokens.unsqueeze(0)], dim=1)
-            prefix_tokens = greedy_tokens.tolist()
+            # Map to tree indices: [0 (root), 1 (first branch), ...]
+            prefix_indices = [0] + list(range(1, depth + 1))
+            logging.info(
+                f"\nPLD at depth {depth} (after greedy path {prefix_indices}):"
+            )
+            logging.info(f"  Greedy tokens: {greedy_tokens.tolist()}")
 
-        # Find PLD candidates from this context
+        # Find PLD match
         pld_tokens = find_candidate_pred_tokens(
             context,
             max_ngram_size=pld_max_ngram_size,
@@ -104,86 +99,157 @@ def add_pld_paths_to_swift_buffers(
         )
 
         if len(pld_tokens) > 0:
-            pld_token_sequences.append(
-                {"depth": depth, "tokens": pld_tokens, "prefix": prefix_tokens}
+            logging.info("  ✓ Found PLD match! Tokens: {pld_tokens.tolist()}")
+            pld_sequences.append(
+                {
+                    "depth": depth,
+                    "tokens": pld_tokens,
+                    "prefix_indices": prefix_indices,
+                    "prefix_length": depth,
+                }
             )
+        else:
+            logging.info("  ✗ No PLD match found")
 
-    if not pld_token_sequences:
-        # No PLD candidates found, return original
+    if not pld_sequences:
+        logging.info("No PLD sequences found. Returning original buffers.")
+        logging.info(f"{'=' * 60}\n")
         return None, swift_buffers
 
-    # --- Build enhanced candidate tensor ---
-    # Original: [sample_token, swift_draft_tokens...]
-    # Enhanced: [sample_token, swift_draft_tokens..., pld_tokens_depth0, pld_tokens_depth1, ...]
+    # --- Build enhanced structures ---
+    original_tree_size = len(tree_indices)
+    current_tree_size = original_tree_size
 
-    base_candidates = torch.cat([sample_token[0], swift_tokens.view(-1)], dim=0)
+    # We'll append PLD tokens to tree_indices
+    new_tree_indices = tree_indices.tolist()
+    new_retrieve_indices = retrieve_indices.tolist()
+    new_p_indices = swift_buffers["p_indices"].copy()
+    new_b_indices = [
+        bi.copy() if isinstance(bi, list) else bi for bi in swift_buffers["b_indices"]
+    ]
 
-    pld_all_tokens = []
-    for pld_seq in pld_token_sequences:
-        pld_all_tokens.append(pld_seq["tokens"])
+    # Expand attention mask and position IDs
+    new_attn_mask = swift_attn_mask.clone()
+    new_position_ids = swift_position_ids.tolist()
 
-    if pld_all_tokens:
-        enhanced_candidates = torch.cat(
-            [base_candidates, torch.cat(pld_all_tokens, dim=0)], dim=0
-        )
-    else:
-        enhanced_candidates = base_candidates
-
-    # --- Build PLD retrieve paths ---
-    current_tree_size = len(tree_indices)
-    pld_token_offset = len(
-        base_candidates
-    )  # Where PLD tokens start in enhanced_candidates
     max_path_len = retrieve_indices.shape[1]
 
-    for pld_seq in pld_token_sequences:
+    for seq_idx, pld_seq in enumerate(pld_sequences):
         depth = pld_seq["depth"]
         tokens = pld_seq["tokens"]
+        prefix_indices = pld_seq["prefix_indices"]
 
-        # Build path: [0, greedy_to_depth..., pld_token_0, pld_token_1, ...]
-        if depth == 0:
-            # Path from root: [0, pld_token_idx, pld_token_idx+1, ...]
-            base_path = [0]
+        logging.info(f"\nAdding PLD sequence {seq_idx} at depth {depth}:")
+        logging.info(f"  Tokens to add: {tokens.tolist()}")
+        logging.info(f"  Prefix indices: {prefix_indices}")
+
+        # Add each PLD token to tree
+        pld_token_indices = []
+        for i, token in enumerate(tokens):
+            token_idx = current_tree_size
+            new_tree_indices.append(token.item())
+            pld_token_indices.append(token_idx)
+
+            # Position ID = depth + i + 1
+            position = depth + i + 1
+            new_position_ids.append(position)
+
+            current_tree_size += 1
+
+        logging.info(f"  Assigned tree indices: {pld_token_indices}")
+
+        # Create retrieve path: prefix + pld_tokens
+        retrieve_path = prefix_indices + pld_token_indices
+
+        # Pad to max length
+        if len(retrieve_path) < max_path_len:
+            retrieve_path = retrieve_path + [-1] * (max_path_len - len(retrieve_path))
         else:
-            # Path following greedy: [0, 1, swift_greedy_indices..., pld_start]
-            # We need to find indices in tree_indices for the greedy path
-            greedy_path = [0]  # Root
-            for d in range(depth):
-                # The greedy choice at depth d is at position (sum of previous depths + 0)
-                # This is simplified - you may need to track actual tree positions
-                greedy_path.append(d + 1)  # Approximate greedy positions
-            base_path = greedy_path
+            retrieve_path = retrieve_path[:max_path_len]
 
-        # Add PLD token positions
-        for i, _ in enumerate(tokens):
-            path = base_path + [pld_token_offset + i]
-            # Pad to max length
-            path = path + [-1] * (max_path_len - len(path))
-            pld_retrieve_paths.append(path[:max_path_len])
+        new_retrieve_indices.append(retrieve_path)
+        logging.info(f"  Retrieve path: {retrieve_path}")
 
-        pld_token_offset += len(tokens)
+        # Add p_indices and b_indices (simplified - no parent blocking for now)
+        new_p_indices.append([-1] + [0] * (max_path_len - 1))
+        new_b_indices.append([[] for _ in range(max_path_len)])
 
-    # --- Update retrieve_indices ---
-    if pld_retrieve_paths:
-        pld_paths_tensor = torch.tensor(
-            pld_retrieve_paths, dtype=torch.long, device=device
-        )
-        enhanced_retrieve_indices = torch.cat(
-            [retrieve_indices, pld_paths_tensor], dim=0
-        )
+    # --- Rebuild attention mask ---
+    total_size = current_tree_size
+    new_attn_mask_expanded = torch.zeros(
+        (1, 1, total_size, total_size), device=device, dtype=swift_attn_mask.dtype
+    )
 
-        enhanced_buffers = copy.deepcopy(swift_buffers)
-        enhanced_buffers["retrieve_indices"] = enhanced_retrieve_indices
+    # Copy original mask
+    new_attn_mask_expanded[:, :, :original_tree_size, :original_tree_size] = (
+        new_attn_mask
+    )
 
-        # Extend p_indices and b_indices for new paths
-        for _ in range(len(pld_retrieve_paths)):
-            enhanced_buffers["p_indices"].append([-1] + [0] * (max_path_len - 1))
-            enhanced_buffers["b_indices"].append([[] for _ in range(max_path_len)])
+    # Add attention for PLD tokens
+    for seq_idx, pld_seq in enumerate(pld_sequences):
+        prefix_indices = pld_seq["prefix_indices"]
+        depth = pld_seq["depth"]
+        num_tokens = len(pld_seq["tokens"])
 
-        logging.info(f"Added {len(pld_retrieve_paths)} PLD paths to SWIFT tree")
-        return enhanced_candidates, enhanced_buffers
+        # PLD tokens start at original_tree_size + offset
+        offset = sum(len(s["tokens"]) for s in pld_sequences[:seq_idx])
+        pld_start = original_tree_size + offset
 
-    return None, swift_buffers
+        for i in range(num_tokens):
+            token_pos = pld_start + i
+
+            # Can attend to root (position 0)
+            new_attn_mask_expanded[0, 0, token_pos, 0] = 1
+
+            # Can attend to prefix (ancestors in the path)
+            for ancestor_idx in prefix_indices:
+                new_attn_mask_expanded[0, 0, token_pos, ancestor_idx] = 1
+
+            # Can attend to previous PLD tokens in same sequence
+            for j in range(i):
+                new_attn_mask_expanded[0, 0, token_pos, pld_start + j] = 1
+
+            # Can attend to itself
+            new_attn_mask_expanded[0, 0, token_pos, token_pos] = 1
+
+    # Convert back to tensors
+    enhanced_buffers = {
+        "swift_attn_mask": new_attn_mask_expanded,
+        "tree_indices": torch.tensor(new_tree_indices, dtype=torch.long, device=device),
+        "swift_position_ids": torch.tensor(
+            new_position_ids, dtype=torch.long, device=device
+        ),
+        "retrieve_indices": torch.tensor(
+            new_retrieve_indices, dtype=torch.long, device=device
+        ),
+        "p_indices": new_p_indices,
+        "b_indices": new_b_indices,
+    }
+
+    logging.info(f"\n{'=' * 60}")
+    logging.info("ENHANCED BUFFERS SUMMARY:")
+    logging.info(f"  Tree size: {original_tree_size} → {current_tree_size}")
+    logging.info(
+        f"  Retrieve paths: {retrieve_indices.shape[0]} → {len(new_retrieve_indices)}"
+    )
+    logging.info(
+        f"  Attention mask shape: {swift_attn_mask.shape} → {new_attn_mask_expanded.shape}"
+    )
+    logging.info(f"  Added {len(pld_sequences)} PLD sequences")
+    logging.info(f"{'=' * 60}\n")
+
+    # Also need to return enhanced candidates
+    # Build the full candidate tensor
+    base_candidates = torch.cat([sample_token[0], swift_tokens.view(-1)], dim=0)
+
+    pld_all_tokens = torch.cat([s["tokens"] for s in pld_sequences], dim=0)
+    enhanced_candidates = torch.cat([base_candidates, pld_all_tokens], dim=0)
+
+    logging.info(
+        f"Enhanced candidates size: {len(base_candidates)} → {len(enhanced_candidates)}"
+    )
+
+    return enhanced_candidates, enhanced_buffers
 
 
 def generate_candidates_with_pld(
@@ -199,19 +265,36 @@ def generate_candidates_with_pld(
     """
     sample_token = sample_token.to(tree_indices.device)
 
+    logging.info("\nGENERATE_CANDIDATES_WITH_PLD:")
+    logging.info(f"  Tree indices size: {len(tree_indices)}")
+    logging.info(f"  Retrieve indices shape: {retrieve_indices.shape}")
+
     if enhanced_candidates is not None:
-        # Use PLD-enhanced candidates
         candidates = enhanced_candidates
+        logging.info(f"  Using ENHANCED candidates: {len(candidates)} tokens")
+        logging.info(f"  Candidates: {candidates.tolist()}")
     else:
-        # Original SWIFT candidates
         candidates_logit = sample_token[0]
         candidates_swift_logits = swift_logits[0]
         candidates = torch.cat(
             [candidates_logit, candidates_swift_logits.view(-1)], dim=-1
         )
+        logging.info(f"  Using ORIGINAL candidates: {len(candidates)} tokens")
+
+    # Validate indices
+    max_candidate_idx = len(candidates) - 1
+    if tree_indices.max().item() > max_candidate_idx:
+        logging.error(
+            f"  ERROR: tree_indices max ({tree_indices.max().item()}) > candidates max index ({max_candidate_idx})"
+        )
+        logging.error(f"  Tree indices: {tree_indices.tolist()}")
+        # Clamp invalid indices
+        tree_indices = torch.clamp(tree_indices, 0, max_candidate_idx)
 
     # Map to tree structure
     tree_candidates = candidates[tree_indices]
+    logging.info(f"  Tree candidates: {tree_candidates.tolist()}")
+
     tree_candidates_ext = torch.cat(
         [
             tree_candidates,
@@ -220,8 +303,16 @@ def generate_candidates_with_pld(
         dim=0,
     )
 
+    # Validate retrieve_indices
+    max_tree_idx = len(tree_candidates_ext) - 1
+    retrieve_indices_clamped = retrieve_indices.clone()
+    retrieve_indices_clamped[retrieve_indices_clamped > max_tree_idx] = max_tree_idx
+    retrieve_indices_clamped[retrieve_indices_clamped < -1] = -1
+
     # Retrieve cartesian candidates
-    cart_candidates = tree_candidates_ext[retrieve_indices]
+    cart_candidates = tree_candidates_ext[retrieve_indices_clamped]
+    logging.info(f"  Cart candidates shape: {cart_candidates.shape}")
+    logging.info(f"  Sample cart candidates:\n{cart_candidates[:3]}")
 
     # Handle probabilities
     if logits_processor is not None:
@@ -234,19 +325,21 @@ def generate_candidates_with_pld(
             dim=-1,
         )
 
-        # Extend with dummy probs for PLD tokens
+        # Extend with probs for PLD tokens
         if enhanced_candidates is not None:
             pld_token_count = len(enhanced_candidates) - len(candidates_prob)
             if pld_token_count > 0:
+                # Assign moderate confidence to PLD tokens
                 pld_probs = (
                     torch.ones(
                         pld_token_count,
                         device=candidates_prob.device,
                         dtype=torch.float32,
                     )
-                    * 0.5
-                )  # Assign moderate confidence to PLD tokens
+                    * 0.7
+                )
                 candidates_prob = torch.cat([candidates_prob, pld_probs], dim=0)
+                logging.info(f"  Extended probs for {pld_token_count} PLD tokens")
 
         tree_candidates_prob = candidates_prob[tree_indices]
         tree_candidates_prob_ext = torch.cat(
@@ -258,7 +351,7 @@ def generate_candidates_with_pld(
             ],
             dim=0,
         )
-        cart_candidates_prob = tree_candidates_prob_ext[retrieve_indices]
+        cart_candidates_prob = tree_candidates_prob_ext[retrieve_indices_clamped]
     else:
         cart_candidates_prob = None
 
@@ -283,17 +376,12 @@ def swift_forward(
 ):
     """
     Enhanced SWIFT forward with PLD integration.
-
-    New args:
-        use_pld: Whether to enable PLD candidate augmentation
-        pld_max_ngram_size: Max n-gram size for PLD
-        pld_num_pred_tokens: Number of tokens PLD predicts
-        max_pld_depths: Maximum tree depths to add PLD (0=root, 1=after 1st token, etc.)
     """
     input_ids = inputs.input_ids.cuda()
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
     input_ids = input_ids.clone()
     accept_length_list = []
+
     # Initialize the past key and value states
     (
         past_key_values,
@@ -303,6 +391,7 @@ def swift_forward(
     model.past_key_values = past_key_values
     model.past_key_values_data = past_key_values_data
     model.current_length_data = current_length_data
+
     input_len = input_ids.shape[1]
     cur_length = input_len
     reset_swift_mode(model)
@@ -322,10 +411,13 @@ def swift_forward(
     # Clone for optimization
     input_past_key_values_data = [kv.clone() for kv in past_key_values_data]
     input_current_length_data = current_length_data.clone()
+
     new_token_num = 0
     draft_token_num = 0
     total_acc_num = 0
-    pld_contribution = 0  # Track how many tokens accepted from PLD
+    pld_contribution = 0
+    pld_attempts = 0
+
     timings = {
         "total_step": [],
         "draft_loop": [],
@@ -333,12 +425,18 @@ def swift_forward(
         "verify": [],
         "accept_update": [],
         "misc_overhead": [],
-        "pld_augmentation": [],  # New timing
+        "pld_augmentation": [],
     }
     step_end_time = time.time()
+
     for idx in range(max_steps):
+        logging.info(f"\n{'#' * 80}")
+        logging.info(f"STEP {idx}")
+        logging.info(f"{'#' * 80}")
+
         start_step = time.time()
         timings["misc_overhead"].append(start_step - step_end_time)
+
         draft_token_num += len(top1_prob)
 
         # Initialize SWIFT buffer
@@ -348,9 +446,12 @@ def swift_forward(
         swift_buffers = generate_swift_buffers(
             swift_choices, device=model.model.layers[-1].self_attn.q_proj.weight.device
         )
-        model.swift_buffers = swift_buffers
-        model.swift_choices = swift_choices
-        model.model.swift_mask = swift_buffers["swift_attn_mask"]
+
+        logging.info("\nOriginal SWIFT structure:")
+        logging.info(f"  Choices: {swift_choices[:5]}...")  # Show first 5
+        logging.info(f"  Tree size: {len(swift_buffers['tree_indices'])}")
+        logging.info(f"  Paths: {swift_buffers['retrieve_indices'].shape[0]}")
+
         # --- PLD AUGMENTATION ---
         pld_start = time.time()
         enhanced_candidates = None
@@ -368,16 +469,25 @@ def swift_forward(
             )
 
             if enhanced_candidates is not None:
+                pld_attempts += 1
                 active_buffers = enhanced_buffers
-                logging.info(
-                    f"Step {idx}: Enhanced with PLD, "
-                    f"paths: {active_buffers['retrieve_indices'].shape[0]} "
-                    f"(+{active_buffers['retrieve_indices'].shape[0] - swift_buffers['retrieve_indices'].shape[0]})"
-                )
+                # Update model buffers
+                model.swift_buffers = enhanced_buffers
+                model.model.swift_mask = enhanced_buffers["swift_attn_mask"]
+                logging.info("✓ Using PLD-enhanced buffers")
+            else:
+                model.swift_buffers = swift_buffers
+                model.model.swift_mask = swift_buffers["swift_attn_mask"]
+                logging.info("✗ No PLD enhancement, using original SWIFT")
+        else:
+            model.swift_buffers = swift_buffers
+            model.model.swift_mask = swift_buffers["swift_attn_mask"]
+
+        model.swift_choices = swift_choices
 
         timings["pld_augmentation"].append(time.time() - pld_start)
 
-        # Generate candidates (now possibly PLD-enhanced)
+        # Generate candidates
         candidates, cart_candidates_prob, tree_candidates = (
             generate_candidates_with_pld(
                 swift_logits,
@@ -388,19 +498,32 @@ def swift_forward(
                 enhanced_candidates=enhanced_candidates,
             )
         )
+
+        logging.info("\nTree decoding with:")
+        logging.info(f"  Tree candidates shape: {tree_candidates.shape}")
+        logging.info(f"  Position IDs: {active_buffers['swift_position_ids'].tolist()}")
+        logging.info(
+            f"  Attention mask: {active_buffers['swift_attn_mask']}"
+        )
+
         # Tree decoding (verification)
         logits, outputs = tree_decoding(
             model,
             tree_candidates,
             past_key_values,
-            swift_buffers["swift_position_ids"],  # Use original position IDs
+            active_buffers["swift_position_ids"],  # Use active position IDs!
             input_ids,
-            active_buffers[
-                "retrieve_indices"
-            ],  # Use possibly enhanced retrieve indices
+            active_buffers["retrieve_indices"],
         )
+
         verify_end_time = time.time()
-        timings["verify"].append(verify_end_time - pld_start)  # Includes PLD time
+        timings["verify"].append(verify_end_time - pld_start)
+
+        logging.info("\nEvaluating posterior:")
+        logging.info(f"  Logits shape: {logits.shape}")
+        logging.info(f"  Candidates shape: {candidates.shape}")
+        logging.info(f"  Number of paths: {candidates.shape[0]}")
+
         # Evaluate posterior
         best_candidate, accept_length, sample_p = evaluate_posterior(
             logits,
@@ -412,24 +535,41 @@ def swift_forward(
             tree_candidates,
             active_buffers["b_indices"],
         )
-        # Track if PLD contributed
-        if (
-            enhanced_candidates is not None
-            and best_candidate >= swift_buffers["retrieve_indices"].shape[0]
-        ):
+
+        logging.info("\nPosterior result:")
+        logging.info(f"  Best candidate: {best_candidate}")
+        logging.info(f"  Accept length: {accept_length}")
+        logging.info(
+            f"  Accepted path: {candidates[best_candidate, : accept_length + 1].tolist()}"
+        )
+
+        # Check if PLD contributed
+        original_path_count = swift_buffers["retrieve_indices"].shape[0]
+        if enhanced_candidates is not None and best_candidate >= original_path_count:
             pld_contribution += accept_length + 1
-            logging.info(f"✓ PLD path accepted! Length: {accept_length + 1}")
+            logging.info(f"{'*' * 60}")
+            logging.info("✓✓✓ PLD PATH ACCEPTED! ✓✓✓")
+            logging.info(
+                f"  Path index: {best_candidate} (PLD path {best_candidate - original_path_count})"
+            )
+            logging.info(f"  Tokens accepted: {accept_length + 1}")
+            logging.info(
+                f"  Path: {candidates[best_candidate, : accept_length + 1].tolist()}"
+            )
+            logging.info(f"{'*' * 60}")
+
         if accept_length == 0:
             first_acc_rates.append(0)
         else:
             first_acc_rates.append(1)
+
         # Update inputs
         input_ids, new_token_num, sample_token = update_inference_inputs(
             input_ids,
             candidates,
             best_candidate,
             accept_length,
-            active_buffers["retrieve_indices"],  # Use active buffers
+            active_buffers["retrieve_indices"],
             logits_processor,
             new_token_num,
             past_key_values_data,
@@ -438,6 +578,7 @@ def swift_forward(
         )
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - verify_end_time)
+
         # Layer set optimization
         if (
             new_token_num > (statistics["context_window"] + 1)
@@ -455,7 +596,8 @@ def swift_forward(
                 optimizer=optimizer,
                 utility=utility,
             )
-        # SWIFT drafting for next iteration
+
+        # SWIFT drafting
         swift_logits, top1_prob = swift_draft(
             model,
             input_ids=sample_token,
@@ -465,43 +607,47 @@ def swift_forward(
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
         )
+
         draft_loop_end_time = time.time()
         draft_time = draft_loop_end_time - accept_update_end_time
         timings["draft_loop"].append(draft_time)
         timings["avg_draft_time"].append(
             draft_time / len(top1_prob) if len(top1_prob) > 0 else 0
         )
-        # Update acceptance stats
+
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
         total_acc_num += accept_length_tree - 1
 
-        # Stopping conditions
         if tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
             break
         if new_token_num > max_new_tokens:
             break
+
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
+
     total_acc_rate = total_acc_num / draft_token_num if draft_token_num > 0 else 0
+    logging.info(f"\n{'=' * 80}")
+    logging.info("FINAL STATISTICS")
+    logging.info(f"{'=' * 80}")
     logging.info(f"Total acceptance rate: {total_acc_rate:.4f}")
+    logging.info(f"PLD attempts: {pld_attempts}")
     logging.info(
         f"PLD contribution: {pld_contribution}/{new_token_num} tokens ({pld_contribution / new_token_num * 100:.2f}%)"
     )
     logging.info(f"Total steps: {idx}")
 
-    # Print timings
-    logging.info("--- Performance Timings (Average per Step) ---")
+    logging.info("\n--- Performance Timings (Average per Step) ---")
     for key, values in timings.items():
         if values:
             avg_time = np.mean(values)
             logging.info(f"{key}: {avg_time:.4f}s")
-        else:
-            logging.info(f"{key}: N/A")
 
     logging.info(f"Average Acceptance Length: {np.mean(accept_length_list) - 1:.4f}")
     logging.info(f"Finished. Total steps: {idx}, Total generated: {new_token_num}")
+
     return input_ids, new_token_num, idx + 1, accept_length_list
 
 
