@@ -455,7 +455,7 @@ def swift_forward(
             enhanced_candidates, enhanced_buffers = add_pld_paths_to_swift_buffers(
                 swift_buffers,
                 input_ids,
-                sample_token,
+                # sample_token,
                 swift_logits,
                 pld_max_ngram_size=pld_max_ngram_size,
                 pld_num_pred_tokens=pld_num_pred_tokens,
