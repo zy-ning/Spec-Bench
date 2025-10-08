@@ -40,11 +40,11 @@ first_acc_rates = []
 def add_pld_paths_to_swift_buffers(
     swift_buffers,
     input_ids,
-    sample_token,
+    # sample_token,
     swift_logits,
     pld_max_ngram_size=3,
     pld_num_pred_tokens=7,
-    max_pld_depths=3,
+    max_pld_depths=2,
 ):
     """
     Add PLD candidate paths to existing SWIFT buffers with proper attention masks.
@@ -75,13 +75,7 @@ def add_pld_paths_to_swift_buffers(
             prefix_indices = []
             logging.info(f"\nPLD at depth {depth} (from root):")
         else:
-            # Build greedy path: sample_token + first choice at each subsequent level
-            if depth == 1:
-                greedy_tokens = sample_token[0]
-            else:
-                greedy_tokens = torch.cat(
-                    [sample_token[0], swift_tokens[: depth - 1, 0]]
-                )
+            greedy_tokens = swift_tokens[: depth - 1, 0]
 
             context = torch.cat([input_ids, greedy_tokens.unsqueeze(0)], dim=1)
             # Map to tree indices: [0 (root), 1 (first branch), ...]
@@ -99,7 +93,7 @@ def add_pld_paths_to_swift_buffers(
         )
 
         if len(pld_tokens) > 0:
-            logging.info("  ✓ Found PLD match! Tokens: {pld_tokens.tolist()}")
+            logging.info(f"  ✓ Found PLD match! Tokens: {pld_tokens.tolist()}")
             pld_sequences.append(
                 {
                     "depth": depth,
@@ -240,7 +234,7 @@ def add_pld_paths_to_swift_buffers(
 
     # Also need to return enhanced candidates
     # Build the full candidate tensor
-    base_candidates = torch.cat([sample_token[0], swift_tokens.view(-1)], dim=0)
+    base_candidates = swift_tokens.view(-1)
 
     pld_all_tokens = torch.cat([s["tokens"] for s in pld_sequences], dim=0)
     enhanced_candidates = torch.cat([base_candidates, pld_all_tokens], dim=0)
@@ -502,9 +496,7 @@ def swift_forward(
         logging.info("\nTree decoding with:")
         logging.info(f"  Tree candidates shape: {tree_candidates.shape}")
         logging.info(f"  Position IDs: {active_buffers['swift_position_ids'].tolist()}")
-        logging.info(
-            f"  Attention mask: {active_buffers['swift_attn_mask']}"
-        )
+        logging.info(f"  Attention mask: {active_buffers['swift_attn_mask']}")
 
         # Tree decoding (verification)
         logits, outputs = tree_decoding(

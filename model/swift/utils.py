@@ -74,7 +74,8 @@ def get_choices_list(prob_list, logits_processor=None):
     """
     choices_list = []
     if logits_processor is not None:
-        candidate_set = [1, 3, 5, 10]
+        # candidate_set = [1, 3, 5, 10]
+        candidate_set = [3, 5, 8, 10]
     else:
         candidate_set = [3, 5, 8, 10]
     for idx, item in enumerate(prob_list):
@@ -414,7 +415,7 @@ def swift_draft(
         position_ids=None,
         max_step_draft=25,
         logits_processor=None,
-        stop_threshold=0.8,
+        stop_threshold=0.85,
 ):
     """
     Draft new tokens using the swift structure.
