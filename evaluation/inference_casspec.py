@@ -77,7 +77,13 @@ def add_pld_paths_to_swift_buffers(
         else:
             greedy_tokens = swift_tokens[: depth - 1, 0]
 
-            context = torch.cat([input_ids, greedy_tokens.unsqueeze(0)], dim=1)
+            # Ensure greedy_tokens is 2D: [1, num_tokens]
+            if greedy_tokens.dim() == 1:
+                greedy_tokens = greedy_tokens.unsqueeze(0)
+            elif greedy_tokens.dim() == 0:
+                greedy_tokens = greedy_tokens.unsqueeze(0).unsqueeze(0)
+
+            context = torch.cat([input_ids, greedy_tokens], dim=1)
             # Map to tree indices: [0 (root), 1 (first branch), ...]
             prefix_indices = [0] + list(range(1, depth + 1))
             logging.info(
