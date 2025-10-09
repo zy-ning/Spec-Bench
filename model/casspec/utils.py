@@ -14,10 +14,10 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-from ..pld.pld import find_candidate_pred_tokens
 from .kv_cache import clone_past_key_values
 
 TOPK = 10  # topk for sparse tree
+
 
 def set_logger(log_path=None):
     """Set the logger to log info in terminal and file `log_path`.
@@ -82,7 +82,8 @@ def get_choices_list(prob_list, logits_processor=None):
     """
     choices_list = []
     if logits_processor is not None:
-        candidate_set = [1, 3, 5, 10]
+        # candidate_set = [1, 3, 5, 10]
+        candidate_set = [3, 5, 8, 10]
     else:
         candidate_set = [3, 5, 8, 10]
     for idx, item in enumerate(prob_list):
@@ -307,234 +308,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     }
     swift_buffers["p_indices"] = swift_p_indices_new
     swift_buffers["b_indices"] = swift_b_indices_new
-
-    logging.info(f"Swift structure buffers: {swift_buffers}")
     return swift_buffers
-
-def generate_swift_with_pld_buffers(
-    swift_choices,
-    input_ids,
-    pld_max_ngram_size=3,
-    pld_num_pred_tokens=7,
-    device="cuda"
-):
-    """
-    Enhanced version that adds PLD candidates to SWIFT tree.
-
-    Args:
-        swift_choices: Original SWIFT tree structure (list of paths like [[0], [0,0], [1], ...])
-        input_ids: Current input sequence for PLD matching
-        pld_max_ngram_size: Max n-gram size for PLD
-        pld_num_pred_tokens: Number of tokens to predict with PLD
-        device: torch device
-
-    Returns:
-        Enhanced swift_buffers with PLD candidates added
-    """
-
-    # 1. Generate PLD candidates at different tree depths
-    pld_candidates = generate_pld_candidates_at_depths(
-        input_ids,
-        swift_choices,
-        pld_max_ngram_size,
-        pld_num_pred_tokens
-    )
-
-    # 2. Merge PLD candidates into SWIFT choices
-    enhanced_swift_choices = merge_pld_into_swift(swift_choices, pld_candidates)
-
-    # 3. Generate buffers with the enhanced tree
-    return generate_swift_buffers(enhanced_swift_choices, device)
-
-
-def generate_pld_candidates_at_depths(
-    input_ids,
-    swift_choices,
-    max_ngram_size=3,
-    num_pred_tokens=7
-):
-    """
-    Generate PLD candidates from different depths in the SWIFT tree.
-
-    Returns:
-        Dict mapping depth -> PLD token sequences
-        e.g., {
-            0: [x, x, x, x, x, x, x],      # PLD from root
-            1: [greedy_token_1, x, x, x, x, x, x],  # PLD after 1st token
-            2: [greedy_token_1, greedy_token_2, x, x, x, x, x],  # PLD after 2nd token
-        }
-    """
-    pld_candidates = {}
-
-    # Determine max depth from swift_choices
-    max_depth = max(len(choice) for choice in swift_choices) if swift_choices else 0
-    max_depth = min(max_depth, 3)  # Limit PLD injection to first 3 levels
-
-    # Generate PLD candidates at each depth
-    for depth in range(max_depth + 1):
-        if depth == 0:
-            # PLD from current position (root of tree)
-            pld_tokens = find_candidate_pred_tokens(
-                input_ids,
-                max_ngram_size,
-                num_pred_tokens
-            )
-        else:
-            # PLD after following greedy path to depth
-            # We need to simulate the greedy path
-            # For now, we'll extract from the most confident SWIFT path
-            greedy_prefix = get_greedy_prefix_from_swift(swift_choices, depth)
-
-            # Extend input_ids with the greedy prefix
-            extended_ids = torch.cat([input_ids, greedy_prefix.unsqueeze(0)], dim=1)
-
-            # Find PLD candidates from this extended context
-            pld_tokens = find_candidate_pred_tokens(
-                extended_ids,
-                max_ngram_size,
-                num_pred_tokens
-            )
-
-            # Prepend the greedy prefix
-            if len(pld_tokens) > 0:
-                pld_tokens = torch.cat([greedy_prefix, pld_tokens])
-
-        if len(pld_tokens) > 0:
-            pld_candidates[depth] = pld_tokens
-
-    return pld_candidates
-
-
-def get_greedy_prefix_from_swift(swift_choices, depth):
-    """
-    Extract the greedy path (first choice at each level) up to given depth.
-
-    Args:
-        swift_choices: [[0], [0,0], [0,1], [1], ...]
-        depth: How many levels deep
-
-    Returns:
-        Tensor of token indices along greedy path
-    """
-    # The greedy path is always [0, 0, 0, ...] in swift_choices indexing
-    # We need to convert this to actual token indices
-    # For simplicity, assume the first token at each level is the greedy one
-
-    greedy_path = [0] * depth  # This represents [[0], [0, 0], [0, 0, 0], ...]
-    return torch.tensor(greedy_path, dtype=torch.long)
-
-
-def merge_pld_into_swift(swift_choices, pld_candidates):
-    """
-    Merge PLD candidates into the SWIFT tree structure.
-
-    Args:
-        swift_choices: Original SWIFT paths like [[0], [0,0], [1], ...]
-        pld_candidates: Dict {depth: tensor([token_ids])}
-
-    Returns:
-        Enhanced swift_choices with PLD paths added
-    """
-    enhanced_choices = swift_choices.copy()
-
-    for depth, pld_tokens in pld_candidates.items():
-        # Convert PLD token sequence to tree path format
-        # PLD tokens need to be added as sequential branches
-
-        if depth == 0:
-            # Add as new branches from root
-            # Create path like [[PLD_BRANCH_ID], [PLD_BRANCH_ID, 0], [PLD_BRANCH_ID, 0, 0], ...]
-            pld_base_idx = get_next_available_branch_idx(swift_choices)
-
-            for i in range(len(pld_tokens)):
-                path = [pld_base_idx] + [0] * i
-                enhanced_choices.append(path)
-
-        else:
-            # Add as branches after the greedy prefix
-            # Path like [[0], [0, PLD_BRANCH_ID], [0, PLD_BRANCH_ID, 0], ...]
-            greedy_prefix = [0] * depth
-            pld_base_idx = get_next_available_branch_idx_at_depth(swift_choices, depth)
-
-            for i in range(len(pld_tokens) - depth):
-                path = greedy_prefix + [pld_base_idx] + [0] * i
-                enhanced_choices.append(path)
-
-    return enhanced_choices
-
-
-def get_next_available_branch_idx(choices):
-    """Find the next available branch index at root level."""
-    if not choices:
-        return 0
-    root_branches = [c[0] for c in choices if len(c) == 1]
-    return max(root_branches) + 1 if root_branches else 0
-
-
-def get_next_available_branch_idx_at_depth(choices, depth):
-    """Find the next available branch index at a specific depth."""
-    branches_at_depth = [c[depth] for c in choices if len(c) > depth]
-    return max(branches_at_depth) + 1 if branches_at_depth else 0
-
-
-@torch.no_grad()
-def initialize_swift_with_pld(
-    input_ids,
-    model,
-    max_new_tokens,
-    past_key_values,
-    past_key_values_data,
-    current_length_data,
-    logits_processor=None,
-    pld_config=None,  # NEW: PLD configuration
-):
-    """
-    Initialize SWIFT with PLD-enhanced candidates.
-    """
-    with torch.inference_mode():
-        # 1. Get base SWIFT logits
-        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
-
-        # 2. Sample/select first token (greedy for now)
-        sample_token = torch.argmax(logits[:, -1])
-        sample_token = sample_token[None, None]
-
-        # 3. Generate SWIFT draft
-        swift_logits, top1_prob = swift_draft(
-            model,
-            input_ids=sample_token,
-            past_key_values_data=past_key_values_data,
-            current_length_data=current_length_data,
-            max_new_tokens=max_new_tokens,
-            logits_processor=None,  # Greedy
-        )
-
-        # 4. Convert SWIFT logits to choices
-        prob_list = top1_prob
-        swift_choices = get_choices_list(prob_list, logits_processor=None)
-
-        # 5. **NEW**: Add PLD candidates
-        if pld_config is not None:
-            swift_buffers = generate_swift_with_pld_buffers(
-                swift_choices,
-                input_ids,
-                pld_max_ngram_size=pld_config.get('max_ngram_size', 3),
-                pld_num_pred_tokens=pld_config.get('num_pred_tokens', 7),
-                device=input_ids.device
-            )
-        else:
-            swift_buffers = generate_swift_buffers(swift_choices, input_ids.device)
-
-        # 6. Generate actual token candidates using the enhanced tree
-        swift_candidates = generate_candidates_with_pld(
-            swift_logits,
-            swift_buffers,
-            sample_token,
-            input_ids,
-            pld_config
-        )
-
-    return swift_candidates, swift_buffers, sample_token, top1_prob
 
 
 def initialize_swift(
@@ -674,7 +448,7 @@ def swift_draft(
     position_ids=None,
     max_step_draft=25,
     logits_processor=None,
-    stop_threshold=0.8,
+    stop_threshold=0.85,
 ):
     """
     Draft new tokens using the swift structure.
@@ -843,137 +617,6 @@ def generate_candidates(
     tree_candidates = tree_candidates.unsqueeze(0)
     return cart_candidates, cart_candidates_prob, tree_candidates
 
-def generate_candidates_with_pld(
-    swift_logits,
-    swift_buffers,
-    sample_token,
-    input_ids,
-    pld_config
-):
-    """
-    Generate candidates combining SWIFT and PLD tokens.
-
-    Returns:
-        cart_candidates: Cartesian product of all candidates
-        tree_candidates: Tree-structured candidates
-    """
-    tree_indices = swift_buffers['tree_indices']
-    retrieve_indices = swift_buffers['retrieve_indices']
-
-    # 1. Get base SWIFT candidates
-    candidates_logit = sample_token[0]
-    candidates_swift_logits = swift_logits[0]
-    swift_tokens = torch.cat([candidates_logit, candidates_swift_logits.view(-1)], dim=-1)
-
-    # 2. **NEW**: Get PLD tokens at different depths
-    pld_tokens_by_depth = {}
-    for depth in range(3):  # Depths 0, 1, 2
-        if depth == 0:
-            context = input_ids
-        else:
-            # Extend with greedy tokens
-            greedy_prefix = swift_tokens[:depth]
-            context = torch.cat([input_ids, greedy_prefix.unsqueeze(0)], dim=1)
-
-        pld_tokens = find_candidate_pred_tokens(
-            context,
-            pld_config.get('max_ngram_size', 3),
-            pld_config.get('num_pred_tokens', 7)
-        )
-
-        if len(pld_tokens) > 0:
-            pld_tokens_by_depth[depth] = pld_tokens
-
-    # 3. Merge SWIFT and PLD tokens into the tree structure
-    # This requires extending the candidates tensor appropriately
-    all_candidates = merge_swift_and_pld_tokens(
-        swift_tokens,
-        pld_tokens_by_depth,
-        tree_indices
-    )
-
-    # 4. Map to tree and cartesian structures
-    tree_candidates = all_candidates[tree_indices]
-    tree_candidates_ext = torch.cat([
-        tree_candidates,
-        torch.zeros((1), dtype=torch.long, device=tree_candidates.device)
-    ], dim=0)
-
-    cart_candidates = tree_candidates_ext[retrieve_indices]
-    tree_candidates = tree_candidates.unsqueeze(0)
-
-    return cart_candidates, None, tree_candidates
-
-
-def merge_swift_and_pld_tokens(swift_tokens, pld_tokens_by_depth, tree_indices):
-    """
-    Merge SWIFT top-K tokens with PLD n-gram tokens.
-
-    Args:
-        swift_tokens: Tensor of SWIFT top-K predictions [sample_token, topk_1, topk_2, ...]
-        pld_tokens_by_depth: Dict {depth: tensor([pld_tokens])}
-        tree_indices: Original SWIFT tree indices
-
-    Returns:
-        Extended candidates tensor with PLD tokens appended
-    """
-    candidates = [swift_tokens]
-
-    # Append PLD tokens for each depth
-    for depth in sorted(pld_tokens_by_depth.keys()):
-        pld_tokens = pld_tokens_by_depth[depth]
-        candidates.append(pld_tokens)
-
-    # Concatenate all candidates
-    all_candidates = torch.cat(candidates, dim=0)
-
-    return all_candidates
-
-def add_pld_paths_to_swift(swift_buffers, input_ids, pld_config):
-    """
-    Simpler approach: Just add PLD paths as additional retrieve_indices rows.
-    """
-    retrieve_indices = swift_buffers['retrieve_indices']
-    tree_indices = swift_buffers['tree_indices']
-
-    pld_paths = []
-
-    # PLD from root (depth 0)
-    pld_tokens_depth0 = find_candidate_pred_tokens(
-        input_ids,
-        pld_config['max_ngram_size'],
-        pld_config['num_pred_tokens']
-    )
-    if len(pld_tokens_depth0) > 0:
-        # Create path indices (these will be appended to tree_indices)
-        base_idx = len(tree_indices)
-        path = [0] + list(range(base_idx, base_idx + len(pld_tokens_depth0)))
-        path = path + [-1] * (retrieve_indices.shape[1] - len(path))
-        pld_paths.append(path)
-
-    # PLD from depth 1 (after first greedy token)
-    if len(tree_indices) > 1:
-        first_greedy = tree_indices[1]
-        extended_input = torch.cat([input_ids, first_greedy.unsqueeze(0).unsqueeze(0)], dim=1)
-
-        pld_tokens_depth1 = find_candidate_pred_tokens(
-            extended_input,
-            pld_config['max_ngram_size'],
-            pld_config['num_pred_tokens']
-        )
-        if len(pld_tokens_depth1) > 0:
-            base_idx = len(tree_indices) + len(pld_tokens_depth0)
-            path = [0, 1] + list(range(base_idx, base_idx + len(pld_tokens_depth1)))
-            path = path + [-1] * (retrieve_indices.shape[1] - len(path))
-            pld_paths.append(path)
-
-    # Add PLD paths to retrieve_indices
-    if pld_paths:
-        pld_paths_tensor = torch.tensor(pld_paths, dtype=torch.long, device=retrieve_indices.device)
-        swift_buffers['retrieve_indices'] = torch.cat([retrieve_indices, pld_paths_tensor], dim=0)
-
-    return swift_buffers
-
 
 def tree_decoding(
     model,
@@ -1047,9 +690,6 @@ def evaluate_posterior(
     """
     # Greedy decoding based on temperature value
     if logits_processor is None:
-        logging.info("Evaluating posterior with greedy decoding.")
-        logging.info("Candidates: " + str(candidates))
-        logging.info("Tree Candidates: " + str(tree_candidates))
         # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
             candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
@@ -1062,9 +702,6 @@ def evaluate_posterior(
             best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
         else:
             best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        logging.info(
-            f"Best candidate: {best_candidate}, Accept length: {accept_length}"
-        )
         return best_candidate, accept_length, logits[best_candidate, accept_length]
     else:
         cart_candidates_prob = cart_candidates_prob.to(logits.device)

@@ -427,13 +427,13 @@ class LlamaModel(_LlamaModel):
             )
 
         if (
-            hasattr(self, "swift_mask")
-            and self.swift_mask is not None
+            hasattr(self, "tree_mask")
+            and self.tree_mask is not None
             and not enabled_draft
         ):
-            swift_mask = self.swift_mask
-            swift_len = swift_mask.size(-1)
-            combined_attention_mask[:, :, -swift_len:, -swift_len:][swift_mask == 0] = (
+            tree_mask = self.tree_mask
+            swift_len = tree_mask.size(-1)
+            combined_attention_mask[:, :, -swift_len:, -swift_len:][tree_mask == 0] = (
                 combined_attention_mask.min()
             )
 
