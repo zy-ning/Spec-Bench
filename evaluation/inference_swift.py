@@ -40,6 +40,8 @@ from model.swift.utils import (
 
 first_acc_rates = []
 
+DEBUG=False
+
 def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
     input_ids = inputs.input_ids.cuda()
@@ -76,7 +78,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     new_token_num = 0
     draft_token_num = 0
     total_acc_num = 0
-    
+
     timings = {
         "total_step": [],
         # "dp_optim": [],
@@ -92,7 +94,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
     for idx in range(max_steps):
         start_step = time.time()
         timings["misc_overhead"].append(start_step - step_end_time)
-        
+
         # drafted tokens + 1 bonus verified token
         draft_token_num += len(top1_prob)
         # Initialize the swift buffer
@@ -110,6 +112,12 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             logits_processor
         )
 
+        if DEBUG:
+            logging.info(f"Step {idx}:")
+            logging.info(f"  Candidates: {candidates}, Tokens: {tokenizer.convert_ids_to_tokens(candidates.flatten().tolist())}")
+            logging.info(f"  Candidate Probs: {cart_candidates_prob}")
+            logging.info(f"  Tree Candidates: {tree_candidates}, Tokens: {tokenizer.convert_ids_to_tokens(tree_candidates.flatten().tolist())}")
+
         logits, outputs = tree_decoding(
             model,
             tree_candidates,
@@ -118,7 +126,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             input_ids,
             swift_buffers["retrieve_indices"],
         )
-        
+
         verify_end_time = time.time()
         timings["verify"].append(verify_end_time - start_step)
 
@@ -127,7 +135,12 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 logits, candidates, logits_processor, cart_candidates_prob, swift_logits[2],
                 swift_buffers["p_indices"], tree_candidates, swift_buffers["b_indices"]
             )
-        
+
+        if DEBUG:
+            logging.info(f"  Best Candidate: {best_candidate}")
+            logging.info(f"  Accept Length: {accept_length}")
+            logging.info(f"  Sample P: {sample_p}")
+
         if accept_length == 0:
             first_acc_rates.append(0)
         else:
@@ -148,6 +161,10 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - verify_end_time)
 
+        if DEBUG:
+            logging.info(f"  New Input IDs: {input_ids[0, -accept_length-1:].tolist()}, Tokens: {tokenizer.convert_ids_to_tokens(input_ids[0, -accept_length-1:].tolist())}")
+            logging.info(f"  Sample Token for Next Step: {sample_token.tolist()}, Tokens: {tokenizer.convert_ids_to_tokens(sample_token.flatten().tolist())}")
+
 
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
@@ -162,7 +179,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
                 statistics,
                 optimizer=optimizer,
                 utility=utility)
-        
+
 
 
         # swift drafting
@@ -175,7 +192,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
         )
-        
+
         draft_loop_end_time = time.time()
         draft_time = draft_loop_end_time - accept_update_end_time
         timings["draft_loop"].append(draft_time)
@@ -183,7 +200,7 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             draft_time / len(top1_prob)
         )
 
-        
+
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
@@ -192,14 +209,14 @@ def swift_forward(inputs, model, tokenizer, max_new_tokens, statistics=None, opt
             break
         if new_token_num > max_new_tokens:
             break
-        
+
         step_end_time = time.time()
         timings["total_step"].append(step_end_time - start_step)
-        
+
     totoal_acc_rate = total_acc_num / draft_token_num
     # logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
     logging.info("Total acceptance rate: {}".format(totoal_acc_rate))
-    
+
     logging.info("total_steps: {}".format(idx))
     # --- Print Timings ---
     logging.info("--- Performance Timings (Average per Step) ---")
@@ -369,7 +386,7 @@ if __name__ == "__main__":
     print(f"Output to {answer_file}")
 
     question_file = f"data/{args.bench_name}/question.jsonl"
-    
+
     if args.answer_file:
         answer_file = args.answer_file
 
@@ -434,7 +451,7 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
-    
+
     print("First acceptance rate: ", np.mean(first_acc_rates))
-    
+
     reorg_answer_file(answer_file)

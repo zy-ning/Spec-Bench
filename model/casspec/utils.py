@@ -14,9 +14,92 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
+from ..pld.pld import find_candidate_pred_tokens
 from .kv_cache import clone_past_key_values
 
 TOPK = 10  # topk for sparse tree
+
+
+@torch.no_grad()
+def swift_pld_draft(
+    model,
+    input_ids=None,
+    sample_token=None,
+    new_token_num=0,
+    past_key_values_data=None,
+    current_length_data=None,
+    max_new_tokens=1024,
+    position_ids=None,
+    max_step_draft=25,
+    logits_processor=None,
+    stop_threshold=0.85,
+):
+    draft_past_key_values_data = []
+    for i in range(len(past_key_values_data)):
+        draft_past_key_values_data.append(past_key_values_data[i].clone())
+    draft_current_length_data = current_length_data.clone()
+    draft_past_key_values = clone_past_key_values(
+        model, draft_past_key_values_data, draft_current_length_data
+    )
+
+    ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
+    with torch.inference_mode():
+        for step_draft in range(max_step_draft):
+            kv_cur_len = draft_current_length_data[0].item()
+            pld_candidate_tokens = find_candidate_pred_tokens(
+                input_ids,
+                max_ngram_size=5,
+                num_pred_tokens=min(5, max_step_draft),
+            )
+            cand_len = pld_candidate_tokens.size(-1)
+            next_draft_input_ids = sample_token.clone()
+            if cand_len > 0:
+                # cat next_draft_input_ids with pld_candidate_tokens
+                next_draft_input_ids = torch.cat(
+                    (next_draft_input_ids, pld_candidate_tokens.unsqueeze(0)), dim=-1
+                )
+            with model.self_draft():
+                draft_outputs = model.model(
+                    input_ids=next_draft_input_ids,
+                    attention_mask=None,
+                    past_key_values=draft_past_key_values,
+                    position_ids=position_ids,
+                )
+            draft_logits = model.lm_head(draft_outputs)
+            if logits_processor is not None:
+                logging.warning("PLD does not support logits_processor")
+            top = torch.topk(draft_logits, TOPK, dim=-1)
+            topk_index, topk_prob = top.indices, top.values
+            selected_tokens = topk_index[:, :, 0]
+            accept_len = cand_len
+            if cand_len > 0:
+                accept_len = (
+                    (~(pld_candidate_tokens == selected_tokens[:, :-1])).cumsum(dim=-1)
+                    < 1
+                ).sum()
+                # --update past_key_values--
+                new_cache_size = kv_cur_len + accept_len + 1
+                draft_current_length_data.fill_(new_cache_size)
+            ss_token.extend(
+                topk_index[:, : 1 + accept_len].unsqueeze(0).unbind(2).tolist()
+            )
+            ss_prob.extend(
+                topk_prob[:, : 1 + accept_len].unsqueeze(0).unbind(2).tolist()
+            )
+            ss_op.extend([None] * (1 + accept_len))
+            origin_draft_probs = draft_logits.softmax(-1)
+            argmax_prob = torch.gather(
+                origin_draft_probs, -1, input_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            top1_prob.extend(argmax_prob.squeeze(0).tolist())
+            min_threshold = argmax_prob.min().item()
+            if (
+                min_threshold < stop_threshold
+                or new_token_num + step_draft + 2 >= max_new_tokens
+                or len(ss_token) >= max_step_draft
+            ):
+                break
+    return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
 
 
 def set_logger(log_path=None):

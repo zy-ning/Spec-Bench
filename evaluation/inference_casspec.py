@@ -12,6 +12,8 @@ from transformers import (
 )
 
 from evaluation.eval import reorg_answer_file, run_eval
+from model.casspec.kv_cache import initialize_past_key_values
+from model.casspec.modeling_llama import LlamaForCausalLM
 from model.casspec.utils import (
     evaluate_posterior,
     generate_candidates,
@@ -22,12 +24,13 @@ from model.casspec.utils import (
     set_logger,
     swift_draft,
     swift_optimization,
+    swift_pld_draft,
     swift_verify,
     tree_decoding,
     update_inference_inputs,
 )
-from model.swift.kv_cache import initialize_past_key_values
-from model.swift.modeling_llama import LlamaForCausalLM
+
+DEBUG = False
 
 
 def casspec_forward(
@@ -62,9 +65,7 @@ def casspec_forward(
     model.model.tree_mask = None
 
     start_prefill = time.time()
-    _, logits = swift_verify(
-        model, input_ids, past_key_values=past_key_values
-    )
+    _, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
     # Obtain the logits from the full model
     if logits_processor is not None:
         last_logits = logits[:, -1]
@@ -83,6 +84,12 @@ def casspec_forward(
     input_current_length_data = current_length_data.clone()
 
     new_token_num = 0
+    if input_len + max_new_tokens > model.config.max_position_embeddings:
+        max_new_tokens = model.config.max_position_embeddings - input_len - 1
+        logging.info(
+            f"[Overflow] The max_new_tokens is set to {max_new_tokens} due to the limitation of the model context length."
+            + f"Max context length: {model.config.max_position_embeddings}, input length: {input_len}"
+        )
     draft_token_num = 0
     total_acc_num = 0
 
@@ -98,9 +105,20 @@ def casspec_forward(
     for idx in range(max_steps):
         start_step = time.time()
 
-        swift_logits, top1_prob = swift_draft(
+        # swift_logits, top1_prob = swift_draft(
+        #     model,
+        #     input_ids=sample_token,
+        #     new_token_num=new_token_num,
+        #     past_key_values_data=past_key_values_data,
+        #     current_length_data=current_length_data,
+        #     max_new_tokens=max_new_tokens,
+        #     logits_processor=logits_processor,
+        # )
+
+        swift_logits, top1_prob = swift_pld_draft(
             model,
-            input_ids=sample_token,
+            input_ids=input_ids,
+            sample_token=sample_token,
             new_token_num=new_token_num,
             past_key_values_data=past_key_values_data,
             current_length_data=current_length_data,
@@ -134,6 +152,16 @@ def casspec_forward(
             logits_processor,
         )
 
+        if DEBUG:
+            logging.info(f"Step {idx}:")
+            logging.info(
+                f"  Candidates: {candidates}, Tokens: {tokenizer.convert_ids_to_tokens(candidates.flatten().tolist())}"
+            )
+            logging.info(f"  Candidate Probs: {cart_candidates_prob}")
+            logging.info(
+                f"  Tree Candidates: {tree_candidates}, Tokens: {tokenizer.convert_ids_to_tokens(tree_candidates.flatten().tolist())}"
+            )
+
         logits, _ = tree_decoding(
             model,
             tree_candidates,
@@ -144,7 +172,7 @@ def casspec_forward(
         )
 
         verify_end_time = time.time()
-        timings["verify"].append(verify_end_time - start_step)
+        timings["verify"].append(verify_end_time - draft_loop_end_time)
 
         best_candidate, accept_length, sample_p = evaluate_posterior(
             logits,
@@ -156,6 +184,11 @@ def casspec_forward(
             tree_candidates,
             swift_buffers["b_indices"],
         )
+
+        if DEBUG:
+            logging.info(f"  Best Candidate: {best_candidate}")
+            logging.info(f"  Accept Length: {accept_length}")
+            logging.info(f"  Sample P: {sample_p}")
 
         input_ids, new_token_num, sample_token = update_inference_inputs(
             input_ids,
@@ -171,6 +204,14 @@ def casspec_forward(
         )
         accept_update_end_time = time.time()
         timings["accept_update"].append(accept_update_end_time - verify_end_time)
+
+        if DEBUG:
+            logging.info(
+                f"  New Input IDs: {input_ids[0, -accept_length - 1 :].tolist()}, Tokens: {tokenizer.convert_ids_to_tokens(input_ids[0, -accept_length - 1 :].tolist())}"
+            )
+            logging.info(
+                f"  Sample Token for next step: {sample_token.tolist()}, Tokens: {tokenizer.convert_ids_to_tokens(sample_token.flatten().tolist())}"
+            )
 
         # layer set optimization
         if (
@@ -477,6 +518,5 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
-
 
     reorg_answer_file(answer_file)
